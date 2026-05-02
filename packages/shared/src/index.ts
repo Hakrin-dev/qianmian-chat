@@ -45,8 +45,8 @@ export const RoomConfigSchema = z.object({
     .min(1, "房间名不能为空")
     .max(30, "房间名最多 30 个字"),
   templateId: RoomTemplateIdSchema,
-  selectedRoleIds: z.array(z.string().min(1)).min(2),
-  activeRoleIds: z.array(z.string().min(1)).min(2),
+  selectedRoleIds: z.array(z.string().min(1)).min(1),
+  activeRoleIds: z.array(z.string().min(1)).min(1),
   maxTurns: z.number().int().min(1).max(60),
   windowSize: z.number().int().min(5).max(50).default(20),
 });
@@ -84,7 +84,7 @@ export type UserMessageInput = z.infer<typeof UserMessageInputSchema>;
 export const CreateRoomInputSchema = z.object({
   name: RoomConfigSchema.shape.name,
   templateId: RoomTemplateIdSchema,
-  selectedRoleIds: z.array(z.string().min(1)).min(2),
+  selectedRoleIds: z.array(z.string().min(1)).min(1),
 });
 export type CreateRoomInput = z.infer<typeof CreateRoomInputSchema>;
 

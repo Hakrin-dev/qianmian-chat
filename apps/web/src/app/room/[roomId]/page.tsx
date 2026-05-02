@@ -15,17 +15,44 @@ const INTERRUPT_LABEL: Record<InterruptType, string> = {
   stop: "停止",
 };
 
+type RoomStateEvent = {
+  roomId: string;
+  running: boolean;
+  turnIndex: number;
+  name?: string;
+  templateId?: string;
+};
+
+type RoomMessagesEvent = {
+  roomId: string;
+  messages: ChatMessage[];
+};
+
+type GenericAck = { ok: true } | { ok: false; error?: unknown };
+type JoinRoomAck =
+  | { ok: true; room: { config?: { name?: string }; running?: boolean; turnIndex?: number; messages?: ChatMessage[] } }
+  | { ok: false; error?: unknown };
+
+const QUICK_INTERRUPTS: Array<{ label: string; type: InterruptType; icon: string }> = [
+  { label: "提问", type: "ask", icon: "🙋" },
+  { label: "纠错", type: "correct", icon: "❌" },
+  { label: "改目标", type: "change_goal", icon: "🎯" },
+  { label: "加设定", type: "add_setting", icon: "🎭" },
+  { label: "停止", type: "stop", icon: "🛑" },
+];
+
 export default function RoomPage() {
   const params = useParams<{ roomId: string }>();
   const router = useRouter();
   const roomId = decodeURIComponent(params.roomId);
 
-  const { roomName, running, turnIndex, messages, setRoom, setRunning, setMessages, startMessage, appendDelta, finalizeMessage } =
+  const { roomName, running, turnIndex, messages, pendingById, setRoom, setRunning, setMessages, startMessage, appendDelta, finalizeMessage } =
     useRoomStore();
 
   const [content, setContent] = useState("");
   const [interruptType, setInterruptType] = useState<InterruptType>("ask");
   const [error, setError] = useState<string | null>(null);
+  const [connected, setConnected] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   const socket = useMemo(() => getSocket(), []);
@@ -33,15 +60,24 @@ export default function RoomPage() {
   useEffect(() => {
     setError(null);
 
-    function onRoomState(s: any) {
-      if (!s?.roomId || s.roomId !== roomId) return;
-      setRoom({ roomId, roomName: s.name ?? roomName ?? "" });
-      setRunning(!!s.running, s.turnIndex);
+    function onConnect() {
+      setConnected(true);
+    }
+    function onDisconnect() {
+      setConnected(false);
     }
 
-    function onRoomMessages(payload: any) {
-      if (payload?.roomId !== roomId) return;
-      setMessages((payload.messages ?? []) as ChatMessage[]);
+    function onRoomState(s: unknown) {
+      const e = s as Partial<RoomStateEvent> | null;
+      if (!e?.roomId || e.roomId !== roomId) return;
+      setRoom({ roomId, roomName: e.name ?? roomName ?? "" });
+      setRunning(!!e.running, e.turnIndex);
+    }
+
+    function onRoomMessages(payload: unknown) {
+      const e = payload as Partial<RoomMessagesEvent> | null;
+      if (e?.roomId !== roomId) return;
+      setMessages((e.messages ?? []) as ChatMessage[]);
       queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
     }
 
@@ -51,9 +87,11 @@ export default function RoomPage() {
       queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
     }
 
-    function onMessageDelta(p: any) {
-      if (p?.roomId !== roomId) return;
-      appendDelta(p.messageId, p.delta ?? "");
+    function onMessageDelta(p: unknown) {
+      const e = p as Partial<{ roomId: string; messageId: string; delta: string }> | null;
+      if (e?.roomId !== roomId) return;
+      if (!e.messageId) return;
+      appendDelta(e.messageId, e.delta ?? "");
       queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
     }
 
@@ -63,9 +101,10 @@ export default function RoomPage() {
       queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
     }
 
-    function onError(p: any) {
-      if (p?.roomId && p.roomId !== roomId) return;
-      setError(p?.message ?? "发生错误");
+    function onError(p: unknown) {
+      const e = p as Partial<{ roomId: string; message: string }> | null;
+      if (e?.roomId && e.roomId !== roomId) return;
+      setError(e?.message ?? "发生错误");
     }
 
     socket.on("room.state", onRoomState);
@@ -74,13 +113,16 @@ export default function RoomPage() {
     socket.on("message.delta", onMessageDelta);
     socket.on("message.done", onMessageDone);
     socket.on("error", onError);
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
 
-    socket.emit("room.join", { roomId }, (ack: any) => {
-      if (!ack?.ok) setError(ack?.error ?? "加入房间失败");
+    socket.emit("room.join", { roomId }, (ack: unknown) => {
+      const res = (ack ?? { ok: false }) as JoinRoomAck;
+      if (!res?.ok) setError(typeof res.error === "string" ? res.error : "加入房间失败");
       else {
-        setRoom({ roomId, roomName: ack.room?.config?.name ?? "" });
-        setRunning(!!ack.room?.running, ack.room?.turnIndex ?? 0);
-        setMessages((ack.room?.messages ?? []) as ChatMessage[]);
+        setRoom({ roomId, roomName: res.room?.config?.name ?? "" });
+        setRunning(!!res.room?.running, res.room?.turnIndex ?? 0);
+        setMessages((res.room?.messages ?? []) as ChatMessage[]);
         queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
       }
     });
@@ -92,6 +134,8 @@ export default function RoomPage() {
       socket.off("message.delta", onMessageDelta);
       socket.off("message.done", onMessageDone);
       socket.off("error", onError);
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, socket]);
@@ -102,8 +146,9 @@ export default function RoomPage() {
     if (!text) return;
 
     setContent("");
-    socket.emit("user.message", { roomId, content: text, interruptType }, (ack: any) => {
-      if (!ack?.ok) setError(ack?.error ?? "发送失败");
+    socket.emit("user.message", { roomId, content: text, interruptType }, (ack: unknown) => {
+      const res = (ack ?? { ok: false }) as GenericAck;
+      if (!res?.ok) setError(typeof res.error === "string" ? res.error : "发送失败");
     });
 
     if (interruptType === "stop") {
@@ -112,17 +157,24 @@ export default function RoomPage() {
     }
   }
 
+  async function sendAndStart() {
+    await sendUserMessage();
+    if (interruptType !== "stop" && !running) startAuto();
+  }
+
   function startAuto() {
     setError(null);
-    socket.emit("room.start", { roomId }, (ack: any) => {
-      if (!ack?.ok) setError(ack?.error ?? "启动失败");
+    socket.emit("room.start", { roomId }, (ack: unknown) => {
+      const res = (ack ?? { ok: false }) as GenericAck;
+      if (!res?.ok) setError(typeof res.error === "string" ? res.error : "启动失败");
     });
   }
 
   function stopAuto() {
     setError(null);
-    socket.emit("room.stop", { roomId }, (ack: any) => {
-      if (!ack?.ok) setError(ack?.error ?? "停止失败");
+    socket.emit("room.stop", { roomId }, (ack: unknown) => {
+      const res = (ack ?? { ok: false }) as GenericAck;
+      if (!res?.ok) setError(typeof res.error === "string" ? res.error : "停止失败");
     });
   }
 
@@ -139,7 +191,8 @@ export default function RoomPage() {
             </button>
             <h1 className="mt-1 truncate text-xl font-semibold">{roomName || "房间"}</h1>
             <div className="mt-1 text-xs text-zinc-600">
-              状态：{running ? "自动对话中" : "已暂停"} · 回合：{turnIndex}
+              状态：{running ? "自动对话中" : "已暂停"} · 回合：{turnIndex} · 连接：
+              <span className={connected ? "text-emerald-700" : "text-red-700"}>{connected ? "已连接" : "已断开"}</span>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -171,18 +224,33 @@ export default function RoomPage() {
           ) : (
             <div className="space-y-3">
               {messages.map((m) => (
-                <div key={m.id} className="flex gap-3">
-                  <div className="mt-0.5 h-8 w-8 shrink-0 rounded-full bg-zinc-100 text-center text-xs leading-8 text-zinc-700">
+                <div key={m.id} className={`flex gap-3 ${m.speakerType === "user" ? "flex-row-reverse" : ""}`}>
+                  <div className={`mt-0.5 h-8 w-8 shrink-0 rounded-full text-center text-xs leading-8 shadow-sm ${
+                    m.speakerType === "user" 
+                      ? "bg-zinc-900 text-white" 
+                      : m.speakerType === "narrator" || m.speakerType === "host"
+                        ? "bg-amber-100 text-amber-900"
+                        : "bg-zinc-100 text-zinc-700"
+                  }`}>
                     {m.speakerName.slice(0, 1)}
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
+                  <div className={`min-w-0 flex-1 ${m.speakerType === "user" ? "text-right" : ""}`}>
+                    <div className={`flex items-center gap-2 ${m.speakerType === "user" ? "flex-row-reverse" : ""}`}>
                       <div className="text-sm font-semibold">{m.speakerName}</div>
                       <div className="text-[11px] text-zinc-500">
                         {new Date(m.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
                       </div>
+                      {pendingById[m.id] ? (
+                        <div className="animate-pulse text-[11px] font-medium text-amber-600">思考中…</div>
+                      ) : null}
                     </div>
-                    <div className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-zinc-900">
+                    <div className={`mt-1 inline-block max-w-full whitespace-pre-wrap break-words rounded-2xl px-4 py-2 text-sm leading-6 shadow-sm ${
+                      m.speakerType === "user"
+                        ? "bg-zinc-900 text-white rounded-tr-none"
+                        : m.speakerType === "narrator" || m.speakerType === "host"
+                          ? "bg-amber-50 text-amber-900 ring-1 ring-amber-100 rounded-tl-none italic"
+                          : "bg-zinc-100 text-zinc-900 rounded-tl-none"
+                    }`}>
                       {m.content}
                     </div>
                   </div>
@@ -193,6 +261,22 @@ export default function RoomPage() {
         </div>
 
         <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-zinc-200">
+          <div className="mb-4 flex flex-wrap gap-2">
+            {QUICK_INTERRUPTS.map((q) => (
+              <button
+                key={q.type}
+                onClick={() => setInterruptType(q.type)}
+                className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
+                  interruptType === q.type
+                    ? "bg-zinc-900 text-white shadow-sm"
+                    : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200"
+                }`}
+              >
+                <span>{q.icon}</span>
+                <span>{q.label}</span>
+              </button>
+            ))}
+          </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <label className="block sm:w-48">
               <div className="text-sm font-medium text-zinc-700">插话类型</div>
@@ -211,23 +295,40 @@ export default function RoomPage() {
 
             <label className="block flex-1">
               <div className="text-sm font-medium text-zinc-700">你的话（中文）</div>
-              <input
+              <textarea
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) void sendUserMessage();
+                  if (e.key === "Enter") {
+                    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                      // Ctrl/Cmd/Shift + Enter 为换行，不拦截默认行为
+                      return;
+                    }
+                    // 纯 Enter 为发送
+                    e.preventDefault();
+                    void sendAndStart();
+                  }
                 }}
-                className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 outline-none focus:border-zinc-400"
-                placeholder="Ctrl/⌘ + Enter 发送"
+                rows={3}
+                className="mt-2 w-full resize-none rounded-xl border border-zinc-200 bg-white px-3 py-2 outline-none focus:border-zinc-400"
+                placeholder="Enter 发送；Ctrl/⌘ + Enter 换行"
               />
             </label>
 
-            <button
-              onClick={() => void sendUserMessage()}
-              className="rounded-xl bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-zinc-800"
-            >
-              发送
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={() => void sendUserMessage()}
+                className="rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-sm font-semibold text-zinc-900 hover:bg-zinc-50"
+              >
+                仅插话
+              </button>
+              <button
+                onClick={() => void sendAndStart()}
+                className="rounded-xl bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-zinc-800"
+              >
+                发送并开始
+              </button>
+            </div>
           </div>
           {error ? <div className="mt-3 text-sm text-red-600">{error}</div> : null}
         </div>

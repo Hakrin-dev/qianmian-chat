@@ -27,7 +27,7 @@ type RoomState = {
   reset: () => void;
 };
 
-export const useRoomStore = create<RoomState>((set, get) => ({
+export const useRoomStore = create<RoomState>((set) => ({
   roomId: null,
   roomName: "",
   running: false,

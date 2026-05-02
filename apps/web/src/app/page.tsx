@@ -12,6 +12,16 @@ const TEMPLATE_LABEL: Record<RoomTemplateId, string> = {
   task: "任务协作",
 };
 
+type CreateRoomAck =
+  | { ok: true; room: { id: string } }
+  | { ok: false; error?: unknown };
+
+const QUICK_PRESETS: Array<{ label: string; name: string; templateId: RoomTemplateId }> = [
+  { label: "深夜闲聊", name: "深夜闲聊局", templateId: "casual" },
+  { label: "面试模拟", name: "面试模拟（HR + 老师）", templateId: "realistic" },
+  { label: "产品评审", name: "产品评审会", templateId: "task" },
+];
+
 export default function HomePage() {
   const router = useRouter();
   const [templateId, setTemplateId] = useState<RoomTemplateId>("casual");
@@ -26,43 +36,58 @@ export default function HomePage() {
     [selected],
   );
 
-  useEffect(() => {
+  function loadRoles() {
     let cancelled = false;
     setError(null);
+    console.log("Fetching roles for template:", templateId);
     fetchRoles(templateId)
       .then((list) => {
         if (cancelled) return;
+        console.log("Fetched roles:", list.length);
         setRoles(list);
         const next: Record<string, boolean> = {};
+        // 自动选中前 3 个
         for (const r of list.slice(0, 3)) next[r.id] = true;
         setSelected(next);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : "获取角色失败");
+        console.error("Failed to fetch roles:", e);
+        const msg = e instanceof Error ? e.message : "获取角色失败";
+        setError(`${msg} (请确认后端服务在 8787 端口运行)`);
       });
     return () => {
       cancelled = true;
     };
+  }
+
+  useEffect(() => {
+    return loadRoles();
   }, [templateId]);
 
   async function onCreateRoom() {
     setError(null);
     if (!roomName.trim()) return setError("房间名不能为空");
-    if (selectedRoleIds.length < 2) return setError("请至少选择 2 个角色");
+    if (selectedRoleIds.length < 1) return setError("请至少选择 1 个角色");
 
     setLoading(true);
     try {
       const socket = getSocket();
-      const res = await new Promise<any>((resolve) => {
+      const res = await new Promise<CreateRoomAck>((resolve) => {
         socket.emit(
           "room.create",
           { name: roomName.trim(), templateId, selectedRoleIds },
-          (ack: any) => resolve(ack),
+          (ack: unknown) => resolve((ack ?? { ok: false }) as CreateRoomAck),
         );
       });
-      if (!res?.ok) throw new Error("创建房间失败");
-      const roomId = res.room.id as string;
+      if (!res?.ok) {
+        const msg =
+          typeof (res as { error?: unknown }).error === "string"
+            ? String((res as { error?: unknown }).error)
+            : "创建房间失败";
+        throw new Error(msg);
+      }
+      const roomId = res.room.id;
       router.push(`/room/${encodeURIComponent(roomId)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "创建房间失败");
@@ -85,6 +110,21 @@ export default function HomePage() {
           <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
             <h2 className="text-lg font-semibold">创建房间</h2>
             <div className="mt-4 space-y-4">
+              <div className="flex flex-wrap gap-2">
+                {QUICK_PRESETS.map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    onClick={() => {
+                      setTemplateId(p.templateId);
+                      setRoomName(p.name);
+                    }}
+                    className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50"
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
               <label className="block">
                 <div className="text-sm font-medium text-zinc-700">房间名（中文）</div>
                 <input
@@ -123,35 +163,61 @@ export default function HomePage() {
           </section>
 
           <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
-            <h2 className="text-lg font-semibold">选择角色（建议 3-6 个）</h2>
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">选择角色（建议 3-6 个）</h2>
+              <button
+                onClick={() => loadRoles()}
+                className="text-xs text-zinc-500 hover:text-zinc-900"
+              >
+                刷新
+              </button>
+            </div>
             <p className="mt-1 text-xs text-zinc-600">当前已选：{selectedRoleIds.length} 个</p>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              {roles.map((r) => (
-                <label
-                  key={r.id}
-                  className="flex cursor-pointer items-start gap-3 rounded-xl border border-zinc-200 p-3 hover:border-zinc-300"
-                >
-                  <input
-                    type="checkbox"
-                    checked={!!selected[r.id]}
-                    onChange={(e) => setSelected((s) => ({ ...s, [r.id]: e.target.checked }))}
-                    className="mt-1"
-                  />
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold">{r.name}</div>
-                    <div className="mt-1 line-clamp-2 text-xs text-zinc-600">{r.identity}</div>
-                    {r.voice?.tags?.length ? (
-                      <div className="mt-2 flex flex-wrap gap-1">
-                        {r.voice.tags.slice(0, 3).map((t) => (
-                          <span key={t} className="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-700">
-                            {t}
-                          </span>
-                        ))}
+              {roles.length === 0 ? (
+                <div className="col-span-2 py-10 text-center text-sm text-zinc-500">
+                  {error ? `加载失败: ${error}` : "未找到角色，请检查服务器是否已启动。"}
+                </div>
+              ) : (
+                roles.map((r) => (
+                  <label
+                    key={r.id}
+                    className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-all ${
+                      selected[r.id]
+                        ? "border-zinc-900 bg-zinc-50 ring-1 ring-zinc-900"
+                        : "border-zinc-200 bg-white hover:border-zinc-300"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!!selected[r.id]}
+                      onChange={(e) =>
+                        setSelected((s: Record<string, boolean>) => ({ ...s, [r.id]: e.target.checked }))
+                      }
+                      className="mt-1 h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-lg">{r.avatar || "👤"}</span>
+                        <div className="truncate text-sm font-semibold">{r.name}</div>
                       </div>
-                    ) : null}
-                  </div>
-                </label>
-              ))}
+                      <div className="mt-1 line-clamp-2 text-xs text-zinc-600">{r.identity}</div>
+                      {r.skills?.length ? (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {r.skills.slice(0, 2).map((s) => (
+                            <span
+                              key={s}
+                              className="rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-600"
+                            >
+                              {s}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </label>
+                ))
+              )}
             </div>
           </section>
         </div>
