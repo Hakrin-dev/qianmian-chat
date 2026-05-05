@@ -7,24 +7,24 @@ import { fetchRoles } from "@/lib/api";
 import { getSocket } from "@/lib/socket";
 
 const TEMPLATE_LABEL: Record<RoomTemplateId, string> = {
-  casual: "闲聊群像",
-  realistic: "现实场景",
-  task: "任务协作",
+  emotional: "情感陪伴",
+  group: "群聊模拟",
+  task: "现实任务",
+};
+
+const TEMPLATE_CONSTRAINTS: Record<RoomTemplateId, { min: number; max: number; label: string }> = {
+  emotional: { min: 1, max: 2, label: "1-2 个角色" },
+  group: { min: 2, max: 10, label: "2-10 个角色" },
+  task: { min: 1, max: 1, label: "1 个角色" },
 };
 
 type CreateRoomAck =
   | { ok: true; room: { id: string } }
   | { ok: false; error?: unknown };
 
-const QUICK_PRESETS: Array<{ label: string; name: string; templateId: RoomTemplateId }> = [
-  { label: "深夜闲聊", name: "深夜闲聊局", templateId: "casual" },
-  { label: "面试模拟", name: "面试模拟（HR + 老师）", templateId: "realistic" },
-  { label: "产品评审", name: "产品评审会", templateId: "task" },
-];
-
 export default function HomePage() {
   const router = useRouter();
-  const [templateId, setTemplateId] = useState<RoomTemplateId>("casual");
+  const [templateId, setTemplateId] = useState<RoomTemplateId>("group");
   const [roomName, setRoomName] = useState("千面聊天室");
   const [roles, setRoles] = useState<RoleCard[]>([]);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
@@ -65,10 +65,22 @@ export default function HomePage() {
     return loadRoles();
   }, [templateId]);
 
+  // 当模板切换时，如果当前选择不符合新模板约束，清空选择
+  useEffect(() => {
+    const constraint = TEMPLATE_CONSTRAINTS[templateId];
+    if (selectedRoleIds.length > constraint.max) {
+      setSelected({});
+    }
+  }, [templateId]);
+
   async function onCreateRoom() {
     setError(null);
     if (!roomName.trim()) return setError("房间名不能为空");
-    if (selectedRoleIds.length < 1) return setError("请至少选择 1 个角色");
+    
+    const constraint = TEMPLATE_CONSTRAINTS[templateId];
+    if (selectedRoleIds.length < constraint.min || selectedRoleIds.length > constraint.max) {
+      return setError(`当前模式请选择 ${constraint.label}`);
+    }
 
     setLoading(true);
     try {
@@ -110,28 +122,13 @@ export default function HomePage() {
           <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
             <h2 className="text-lg font-semibold">创建房间</h2>
             <div className="mt-4 space-y-4">
-              <div className="flex flex-wrap gap-2">
-                {QUICK_PRESETS.map((p) => (
-                  <button
-                    key={p.label}
-                    type="button"
-                    onClick={() => {
-                      setTemplateId(p.templateId);
-                      setRoomName(p.name);
-                    }}
-                    className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50"
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </div>
               <label className="block">
                 <div className="text-sm font-medium text-zinc-700">房间名（中文）</div>
                 <input
                   value={roomName}
                   onChange={(e) => setRoomName(e.target.value)}
                   className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 outline-none focus:border-zinc-400"
-                  placeholder="例如：周一夜聊 / 面试模拟 / 产品评审"
+                  placeholder="请输入房间名"
                 />
               </label>
 
@@ -164,7 +161,7 @@ export default function HomePage() {
 
           <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">选择角色（建议 3-6 个）</h2>
+              <h2 className="text-lg font-semibold">选择角色（{TEMPLATE_CONSTRAINTS[templateId].label}）</h2>
               <button
                 onClick={() => loadRoles()}
                 className="text-xs text-zinc-500 hover:text-zinc-900"

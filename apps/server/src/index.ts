@@ -69,6 +69,8 @@ type RoomRuntime = {
   summary: string;
   interruptQueue: InterruptItem[];
   running: boolean;
+  muted: boolean; // 新增：禁言状态
+  mentionRoleIds: string[]; // 新增：被 @ 的角色列表
   turnIndex: number;
   lastSpeakerRoleId?: string;
   loopToken?: string;
@@ -303,10 +305,10 @@ function computeInstruction(room: RoomRuntime, role: RoleCard): string {
   }
 
   // 常规推进逻辑
-  if (t === "realistic") {
+  if (t === "task") {
     return "请根据当前场景，用专业口吻给出一个具体的、可操作的推进点，并抛出一个澄清问题。";
   }
-  if (t === "task") {
+  if (t === "group") {
     return "请针对当前任务进度，给出一个实质性的建议或指出一个潜在风险，并询问其他角色的看法。";
   }
   return "请接住上一条对话的梗或话题点，用你的独特口吻发表见解，并抛出一个开放性问题。";
@@ -316,6 +318,17 @@ function pickNextRole(room: RoomRuntime): RoleCard {
   const active = pickActiveRoles(room);
   const last = room.lastSpeakerRoleId;
   const nextInterrupt = room.interruptQueue[0];
+
+  // 如果有被 @ 的角色，优先从中选择
+  if (room.mentionRoleIds.length > 0) {
+    const mentioned = active.filter(r => room.mentionRoleIds.includes(r.id));
+    if (mentioned.length > 0) {
+      // 从被提到的角色中随机选一个，然后从待选列表中移除（或在发言后移除）
+      const chosen = mentioned[Math.floor(Math.random() * mentioned.length)];
+      // 注意：我们在发言后再从 mentionRoleIds 中移除，或者在这里一次性消费
+      return chosen;
+    }
+  }
 
   function roleScore(r: RoleCard): number {
     let s = Math.random() * 2.0; // 基础随机性
@@ -404,12 +417,12 @@ async function directorStep(params: {
   const host = shouldHostIntervene(room);
   if (host) {
     return {
-      nextSpeaker: { type: "narrator" },
-      intent: "transition",
-      phase: room.config.templateId === "realistic" ? "clarify" : "free",
-      instruction: "大家好，欢迎来到这个聊天室。我们先围绕目标开始聊聊吧，谁先起个头？",
-      shouldStop: false,
-    };
+        nextSpeaker: { type: "narrator" },
+        intent: "transition",
+        phase: room.config.templateId === "task" ? "clarify" : "free",
+        instruction: "大家好，欢迎来到这个聊天室。我们先围绕目标开始聊聊吧，谁先起个头？",
+        shouldStop: false,
+      };
   }
 
   const role = pickNextRole(room);
@@ -443,6 +456,12 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 
   while (room.running) {
     if (room.loopToken !== loopToken) break;
+
+    // 如果处于禁言状态，且没有被 @ 的人需要回答，则等待
+    if (room.muted && room.mentionRoleIds.length === 0) {
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
 
     const decision = await directorStep({ room });
     
@@ -488,7 +507,11 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
         if (!role) break;
 
         // 模拟“正在输入”
-        const thinkingTime = 600 + Math.random() * 1000;
+        let thinkingTime = 600 + Math.random() * 1000;
+        // 如果是群聊模块，调慢响应时间
+        if (room.config.templateId === "group") {
+          thinkingTime += 1500 + Math.random() * 2000;
+        }
         await new Promise((r) => setTimeout(r, thinkingTime));
         if (!room.running) break;
 
@@ -523,6 +546,10 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
           m.content = content;
           m.meta = { ...(m.meta ?? {}), ...(meta ?? {}) };
           room.lastSpeakerRoleId = role.id;
+          
+          // 如果该角色是被 @ 的，从列表中移除
+          room.mentionRoleIds = room.mentionRoleIds.filter(id => id !== role.id);
+          
           io.to(roomId).emit("message.done", m);
         } catch (err: any) {
           if (err.name === 'AbortError') {
@@ -551,7 +578,11 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 
     // 换人前的等待：模拟对方阅读和思考
     const lastMsgLen = room.messages[room.messages.length - 1]?.content.length ?? 0;
-    const cooldown = Math.min(3500, 1000 + lastMsgLen * 25); 
+    let cooldown = Math.min(3500, 1000 + lastMsgLen * 25); 
+    // 如果是群聊模块，增加等待时间
+    if (room.config.templateId === "group") {
+      cooldown += 2000 + Math.random() * 2000;
+    }
     await new Promise((r) => setTimeout(r, cooldown));
   }
 }
@@ -621,6 +652,19 @@ async function main() {
           return;
         }
         const cfg = parsed.data;
+
+        // 服务端校验角色数量约束
+        const roleCount = cfg.selectedRoleIds.length;
+        if (cfg.templateId === "emotional" && (roleCount < 1 || roleCount > 2)) {
+          return ack?.({ ok: false, error: "情感陪伴模式请选择 1-2 个角色" });
+        }
+        if (cfg.templateId === "group" && (roleCount < 2 || roleCount > 10)) {
+          return ack?.({ ok: false, error: "群聊模拟模式请选择 2-10 个角色" });
+        }
+        if (cfg.templateId === "task" && roleCount !== 1) {
+          return ack?.({ ok: false, error: "现实任务模式请选择 1 个角色" });
+        }
+
         const id = nowId("room");
         const runtime: RoomRuntime = {
           id,
@@ -629,13 +673,15 @@ async function main() {
             templateId: cfg.templateId,
             selectedRoleIds: cfg.selectedRoleIds,
             activeRoleIds: cfg.selectedRoleIds.slice(0, Math.min(6, cfg.selectedRoleIds.length)),
-            maxTurns: cfg.templateId === "casual" ? 30 : cfg.templateId === "realistic" ? 16 : 18,
+            maxTurns: cfg.templateId === "emotional" ? 30 : cfg.templateId === "group" ? 24 : 18,
             windowSize: 20,
           },
           messages: [],
           summary: "",
           interruptQueue: [],
           running: false,
+          muted: false,
+          mentionRoleIds: [],
           turnIndex: 0,
         };
         rooms.set(id, runtime);
@@ -649,10 +695,15 @@ async function main() {
           return;
         }
         socket.join(room.id);
-        ack?.({ ok: true, room });
+        
+        // 获取当前房间的角色详情
+        const roles = pickActiveRoles(room);
+        
+        ack?.({ ok: true, room: { ...room, roles } });
         socket.emit("room.state", {
           roomId: room.id,
           running: room.running,
+          muted: room.muted,
           turnIndex: room.turnIndex,
           name: room.config.name,
           templateId: room.config.templateId,
@@ -681,6 +732,21 @@ async function main() {
         room.streamAbort?.abort();
         room.loopToken = nowId("loop"); 
         ack?.({ ok: true });
+      });
+
+      socket.on("room.mute", (data: { roomId: string; muted: boolean }, ack?: (res: unknown) => void) => {
+        const room = rooms.get(data.roomId);
+        if (!room) return ack?.({ ok: false, error: "房间不存在" });
+        room.muted = data.muted;
+        ack?.({ ok: true });
+        io.to(room.id).emit("room.state", {
+          roomId: room.id,
+          running: room.running,
+          muted: room.muted,
+          turnIndex: room.turnIndex,
+          name: room.config.name,
+          templateId: room.config.templateId,
+        });
       });
 
       socket.on("user.message", (input, ack?: (res: unknown) => void) => {
@@ -721,6 +787,11 @@ async function main() {
         };
         enqueueInterrupt(room, item);
         
+        // 处理 @ 提到的人
+        if (data.mentionRoleIds && data.mentionRoleIds.length > 0) {
+          room.mentionRoleIds = [...new Set([...room.mentionRoleIds, ...data.mentionRoleIds])];
+        }
+
         // 如果用户发了消息，强制中断当前 LLM 流（如果正在运行）
         if (room.running && room.streamAbort) {
           room.streamAbort.abort();

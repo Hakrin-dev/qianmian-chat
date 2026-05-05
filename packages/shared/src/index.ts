@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const RoomTemplateIdSchema = z.enum(["casual", "realistic", "task"]);
+export const RoomTemplateIdSchema = z.enum(["emotional", "group", "task"]);
 export type RoomTemplateId = z.infer<typeof RoomTemplateIdSchema>;
 
 export const InterruptTypeSchema = z.enum([
@@ -78,6 +78,7 @@ export const UserMessageInputSchema = z.object({
   roomId: z.string().min(1),
   content: z.string().min(1).max(1000),
   interruptType: InterruptTypeSchema.default("ask"),
+  mentionRoleIds: z.array(z.string()).optional(),
 });
 export type UserMessageInput = z.infer<typeof UserMessageInputSchema>;
 

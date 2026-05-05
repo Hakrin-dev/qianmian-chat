@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import type { InterruptType } from "@qianmian/shared";
+import type { InterruptType, RoleCard, RoomTemplateId } from "@qianmian/shared";
 import { getSocket } from "@/lib/socket";
 import { useRoomStore, type ChatMessage } from "@/lib/store";
 
@@ -18,9 +18,10 @@ const INTERRUPT_LABEL: Record<InterruptType, string> = {
 type RoomStateEvent = {
   roomId: string;
   running: boolean;
+  muted?: boolean;
   turnIndex: number;
   name?: string;
-  templateId?: string;
+  templateId?: RoomTemplateId;
 };
 
 type RoomMessagesEvent = {
@@ -30,7 +31,17 @@ type RoomMessagesEvent = {
 
 type GenericAck = { ok: true } | { ok: false; error?: unknown };
 type JoinRoomAck =
-  | { ok: true; room: { config?: { name?: string }; running?: boolean; turnIndex?: number; messages?: ChatMessage[] } }
+  | { 
+      ok: true; 
+      room: { 
+        config?: { name?: string; templateId?: RoomTemplateId }; 
+        running?: boolean; 
+        muted?: boolean;
+        turnIndex?: number; 
+        messages?: ChatMessage[];
+        roles?: RoleCard[];
+      } 
+    }
   | { ok: false; error?: unknown };
 
 const QUICK_INTERRUPTS: Array<{ label: string; type: InterruptType; icon: string }> = [
@@ -53,6 +64,10 @@ export default function RoomPage() {
   const [interruptType, setInterruptType] = useState<InterruptType>("ask");
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [roles, setRoles] = useState<RoleCard[]>([]);
+  const [selectedMentionRoleIds, setSelectedMentionRoleIds] = useState<string[]>([]);
+  const [templateId, setTemplateId] = useState<RoomTemplateId>("group");
   const listRef = useRef<HTMLDivElement | null>(null);
 
   const socket = useMemo(() => getSocket(), []);
@@ -72,6 +87,8 @@ export default function RoomPage() {
       if (!e?.roomId || e.roomId !== roomId) return;
       setRoom({ roomId, roomName: e.name ?? roomName ?? "" });
       setRunning(!!e.running, e.turnIndex);
+      if (e.muted !== undefined) setMuted(e.muted);
+      if (e.templateId) setTemplateId(e.templateId);
     }
 
     function onRoomMessages(payload: unknown) {
@@ -123,6 +140,9 @@ export default function RoomPage() {
         setRoom({ roomId, roomName: res.room?.config?.name ?? "" });
         setRunning(!!res.room?.running, res.room?.turnIndex ?? 0);
         setMessages((res.room?.messages ?? []) as ChatMessage[]);
+        if (res.room?.muted !== undefined) setMuted(res.room.muted);
+        if (res.room?.config?.templateId) setTemplateId(res.room.config.templateId);
+        if (res.room?.roles) setRoles(res.room.roles);
         queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
       }
     });
@@ -146,7 +166,10 @@ export default function RoomPage() {
     if (!text) return;
 
     setContent("");
-    socket.emit("user.message", { roomId, content: text, interruptType }, (ack: unknown) => {
+    const mentionRoleIds = selectedMentionRoleIds;
+    setSelectedMentionRoleIds([]); // 发送后重置 @ 列表
+
+    socket.emit("user.message", { roomId, content: text, interruptType, mentionRoleIds }, (ack: unknown) => {
       const res = (ack ?? { ok: false }) as GenericAck;
       if (!res?.ok) setError(typeof res.error === "string" ? res.error : "发送失败");
     });
@@ -176,6 +199,20 @@ export default function RoomPage() {
       const res = (ack ?? { ok: false }) as GenericAck;
       if (!res?.ok) setError(typeof res.error === "string" ? res.error : "停止失败");
     });
+  }
+
+  function toggleMute() {
+    const nextMuted = !muted;
+    socket.emit("room.mute", { roomId, muted: nextMuted }, (ack: unknown) => {
+      const res = (ack ?? { ok: false }) as GenericAck;
+      if (!res?.ok) setError(typeof res.error === "string" ? res.error : "禁言切换失败");
+    });
+  }
+
+  function toggleMention(roleId: string) {
+    setSelectedMentionRoleIds((prev) =>
+      prev.includes(roleId) ? prev.filter((id) => id !== roleId) : [...prev, roleId],
+    );
   }
 
   return (
@@ -210,6 +247,18 @@ export default function RoomPage() {
             >
               暂停
             </button>
+            {templateId === "group" && (
+              <button
+                onClick={toggleMute}
+                className={`rounded-xl px-3 py-2 text-sm font-semibold transition-all ${
+                  muted
+                    ? "bg-red-100 text-red-700 ring-1 ring-red-200"
+                    : "border border-zinc-200 bg-white text-zinc-900"
+                }`}
+              >
+                {muted ? "🙊 已禁言" : "🔊 禁言 AI"}
+              </button>
+            )}
           </div>
         </header>
 
@@ -261,7 +310,7 @@ export default function RoomPage() {
         </div>
 
         <div className="mt-4 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-zinc-200">
-          <div className="mb-4 flex flex-wrap gap-2">
+          <div className="mb-4 flex flex-wrap items-center gap-2">
             {QUICK_INTERRUPTS.map((q) => (
               <button
                 key={q.type}
@@ -276,6 +325,25 @@ export default function RoomPage() {
                 <span>{q.label}</span>
               </button>
             ))}
+
+            {templateId === "group" && roles.length > 0 && (
+              <div className="ml-2 flex flex-wrap items-center gap-2 border-l border-zinc-200 pl-4">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">@ 提到:</span>
+                {roles.map((r) => (
+                  <button
+                    key={r.id}
+                    onClick={() => toggleMention(r.id)}
+                    className={`rounded-full px-2 py-1 text-[11px] font-medium transition-all ${
+                      selectedMentionRoleIds.includes(r.id)
+                        ? "bg-blue-100 text-blue-700 ring-1 ring-blue-200"
+                        : "bg-zinc-50 text-zinc-500 hover:bg-zinc-100"
+                    }`}
+                  >
+                    {r.avatar} {r.name}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <label className="block sm:w-48">
