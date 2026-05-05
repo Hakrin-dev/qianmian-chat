@@ -12,13 +12,14 @@ const INTERRUPT_LABEL: Record<InterruptType, string> = {
   add_constraint: "新增约束",
   add_setting: "新增设定",
   change_goal: "改目标",
+  mute_roles: "禁言/解除",
   stop: "停止",
 };
 
 type RoomStateEvent = {
   roomId: string;
   running: boolean;
-  muted?: boolean;
+  mutedRoleIds?: string[];
   turnIndex: number;
   name?: string;
   templateId?: RoomTemplateId;
@@ -36,7 +37,7 @@ type JoinRoomAck =
       room: { 
         config?: { name?: string; templateId?: RoomTemplateId }; 
         running?: boolean; 
-        muted?: boolean;
+        mutedRoleIds?: string[];
         turnIndex?: number; 
         messages?: ChatMessage[];
         roles?: RoleCard[];
@@ -49,6 +50,7 @@ const QUICK_INTERRUPTS: Array<{ label: string; type: InterruptType; icon: string
   { label: "纠错", type: "correct", icon: "❌" },
   { label: "改目标", type: "change_goal", icon: "🎯" },
   { label: "加设定", type: "add_setting", icon: "🎭" },
+  { label: "禁言", type: "mute_roles", icon: "🙊" },
   { label: "停止", type: "stop", icon: "🛑" },
 ];
 
@@ -64,11 +66,13 @@ export default function RoomPage() {
   const [interruptType, setInterruptType] = useState<InterruptType>("ask");
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
-  const [muted, setMuted] = useState(false);
+  const [mutedRoleIds, setMutedRoleIds] = useState<string[]>([]);
   const [roles, setRoles] = useState<RoleCard[]>([]);
-  const [selectedMentionRoleIds, setSelectedMentionRoleIds] = useState<string[]>([]);
+  const [selectedRoleIdsForAction, setSelectedRoleIdsForAction] = useState<string[]>([]);
+  const [showMentionPanel, setShowMentionPanel] = useState(false);
   const [templateId, setTemplateId] = useState<RoomTemplateId>("group");
   const listRef = useRef<HTMLDivElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const socket = useMemo(() => getSocket(), []);
 
@@ -87,7 +91,7 @@ export default function RoomPage() {
       if (!e?.roomId || e.roomId !== roomId) return;
       setRoom({ roomId, roomName: e.name ?? roomName ?? "" });
       setRunning(!!e.running, e.turnIndex);
-      if (e.muted !== undefined) setMuted(e.muted);
+      if (e.mutedRoleIds !== undefined) setMutedRoleIds(e.mutedRoleIds);
       if (e.templateId) setTemplateId(e.templateId);
     }
 
@@ -140,7 +144,7 @@ export default function RoomPage() {
         setRoom({ roomId, roomName: res.room?.config?.name ?? "" });
         setRunning(!!res.room?.running, res.room?.turnIndex ?? 0);
         setMessages((res.room?.messages ?? []) as ChatMessage[]);
-        if (res.room?.muted !== undefined) setMuted(res.room.muted);
+        if (res.room?.mutedRoleIds !== undefined) setMutedRoleIds(res.room.mutedRoleIds);
         if (res.room?.config?.templateId) setTemplateId(res.room.config.templateId);
         if (res.room?.roles) setRoles(res.room.roles);
         queueMicrotask(() => listRef.current?.scrollTo({ top: listRef.current.scrollHeight }));
@@ -165,9 +169,20 @@ export default function RoomPage() {
     const text = content.trim();
     if (!text) return;
 
+    if (interruptType === "mute_roles") {
+      if (selectedRoleIdsForAction.length === 0) return setError("请先选择要禁言/解除的角色");
+      // 逻辑：如果选中的人都在禁言列表里，则解除；否则全部禁言
+      const allMuted = selectedRoleIdsForAction.every(id => mutedRoleIds.includes(id));
+      socket.emit("room.mute", { roomId, roleIds: selectedRoleIdsForAction, muted: !allMuted });
+      setSelectedRoleIdsForAction([]);
+      setContent("");
+      return;
+    }
+
     setContent("");
-    const mentionRoleIds = selectedMentionRoleIds;
-    setSelectedMentionRoleIds([]); // 发送后重置 @ 列表
+    const mentionRoleIds = selectedRoleIdsForAction;
+    setSelectedRoleIdsForAction([]); 
+    setShowMentionPanel(false);
 
     socket.emit("user.message", { roomId, content: text, interruptType, mentionRoleIds }, (ack: unknown) => {
       const res = (ack ?? { ok: false }) as GenericAck;
@@ -175,14 +190,13 @@ export default function RoomPage() {
     });
 
     if (interruptType === "stop") {
-      // 让 stop 更直观：同时请求停止
       socket.emit("room.stop", { roomId });
     }
   }
 
   async function sendAndStart() {
     await sendUserMessage();
-    if (interruptType !== "stop" && !running) startAuto();
+    if (interruptType !== "stop" && interruptType !== "mute_roles" && !running) startAuto();
   }
 
   function startAuto() {
@@ -201,18 +215,23 @@ export default function RoomPage() {
     });
   }
 
-  function toggleMute() {
-    const nextMuted = !muted;
-    socket.emit("room.mute", { roomId, muted: nextMuted }, (ack: unknown) => {
-      const res = (ack ?? { ok: false }) as GenericAck;
-      if (!res?.ok) setError(typeof res.error === "string" ? res.error : "禁言切换失败");
-    });
-  }
-
-  function toggleMention(roleId: string) {
-    setSelectedMentionRoleIds((prev) =>
+  function toggleRoleSelection(roleId: string) {
+    setSelectedRoleIdsForAction((prev) =>
       prev.includes(roleId) ? prev.filter((id) => id !== roleId) : [...prev, roleId],
     );
+  }
+
+  function onTextareaChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    const val = e.target.value;
+    setContent(val);
+    
+    // 检查最后输入的字符是否为 @
+    const lastChar = val.slice(-1);
+    if (lastChar === "@") {
+      setShowMentionPanel(true);
+    } else if (showMentionPanel && !val.includes("@")) {
+      setShowMentionPanel(false);
+    }
   }
 
   return (
@@ -247,18 +266,6 @@ export default function RoomPage() {
             >
               暂停
             </button>
-            {templateId === "group" && (
-              <button
-                onClick={toggleMute}
-                className={`rounded-xl px-3 py-2 text-sm font-semibold transition-all ${
-                  muted
-                    ? "bg-red-100 text-red-700 ring-1 ring-red-200"
-                    : "border border-zinc-200 bg-white text-zinc-900"
-                }`}
-              >
-                {muted ? "🙊 已禁言" : "🔊 禁言 AI"}
-              </button>
-            )}
           </div>
         </header>
 
@@ -314,7 +321,10 @@ export default function RoomPage() {
             {QUICK_INTERRUPTS.map((q) => (
               <button
                 key={q.type}
-                onClick={() => setInterruptType(q.type)}
+                onClick={() => {
+                  setInterruptType(q.type);
+                  setSelectedRoleIdsForAction([]); // 切换类型时重置选择
+                }}
                 className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
                   interruptType === q.type
                     ? "bg-zinc-900 text-white shadow-sm"
@@ -326,22 +336,30 @@ export default function RoomPage() {
               </button>
             ))}
 
-            {templateId === "group" && roles.length > 0 && (
+            {(interruptType === "mute_roles" || showMentionPanel) && roles.length > 0 && (
               <div className="ml-2 flex flex-wrap items-center gap-2 border-l border-zinc-200 pl-4">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">@ 提到:</span>
-                {roles.map((r) => (
-                  <button
-                    key={r.id}
-                    onClick={() => toggleMention(r.id)}
-                    className={`rounded-full px-2 py-1 text-[11px] font-medium transition-all ${
-                      selectedMentionRoleIds.includes(r.id)
-                        ? "bg-blue-100 text-blue-700 ring-1 ring-blue-200"
-                        : "bg-zinc-50 text-zinc-500 hover:bg-zinc-100"
-                    }`}
-                  >
-                    {r.avatar} {r.name}
-                  </button>
-                ))}
+                <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">
+                  {interruptType === "mute_roles" ? "选择禁言对象:" : "@ 指定角色:"}
+                </span>
+                {roles.map((r) => {
+                  const isMuted = mutedRoleIds.includes(r.id);
+                  const isSelected = selectedRoleIdsForAction.includes(r.id);
+                  return (
+                    <button
+                      key={r.id}
+                      onClick={() => toggleRoleSelection(r.id)}
+                      className={`rounded-full px-2 py-1 text-[11px] font-medium transition-all ${
+                        isSelected
+                          ? "bg-blue-100 text-blue-700 ring-1 ring-blue-200"
+                          : isMuted
+                            ? "bg-red-50 text-red-400 opacity-60"
+                            : "bg-zinc-50 text-zinc-500 hover:bg-zinc-100"
+                      }`}
+                    >
+                      {r.avatar} {r.name} {isMuted && "(已禁言)"}
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -350,7 +368,10 @@ export default function RoomPage() {
               <div className="text-sm font-medium text-zinc-700">插话类型</div>
               <select
                 value={interruptType}
-                onChange={(e) => setInterruptType(e.target.value as InterruptType)}
+                onChange={(e) => {
+                  setInterruptType(e.target.value as InterruptType);
+                  setSelectedRoleIdsForAction([]);
+                }}
                 className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 outline-none focus:border-zinc-400"
               >
                 {Object.entries(INTERRUPT_LABEL).map(([k, v]) => (
@@ -364,8 +385,9 @@ export default function RoomPage() {
             <label className="block flex-1">
               <div className="text-sm font-medium text-zinc-700">你的话（中文）</div>
               <textarea
+                ref={textareaRef}
                 value={content}
-                onChange={(e) => setContent(e.target.value)}
+                onChange={onTextareaChange}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") {
                     if (e.ctrlKey || e.metaKey || e.shiftKey) {
@@ -379,7 +401,11 @@ export default function RoomPage() {
                 }}
                 rows={3}
                 className="mt-2 w-full resize-none rounded-xl border border-zinc-200 bg-white px-3 py-2 outline-none focus:border-zinc-400"
-                placeholder="Enter 发送；Ctrl/⌘ + Enter 换行"
+                placeholder={
+                  interruptType === "mute_roles"
+                    ? "选中角色后，点击“仅插话”执行禁言/解除"
+                    : "Enter 发送；Ctrl/⌘ + Enter 换行；输入 @ 选择角色"
+                }
               />
             </label>
 

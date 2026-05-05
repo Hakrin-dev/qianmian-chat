@@ -69,8 +69,8 @@ type RoomRuntime = {
   summary: string;
   interruptQueue: InterruptItem[];
   running: boolean;
-  muted: boolean; // 新增：禁言状态
-  mentionRoleIds: string[]; // 新增：被 @ 的角色列表
+  mutedRoleIds: string[]; // 修改：存储被禁言的角色 ID 列表
+  mentionRoleIds: string[]; 
   turnIndex: number;
   lastSpeakerRoleId?: string;
   loopToken?: string;
@@ -121,7 +121,7 @@ function makeRoomSystemRule(room: RoomRuntime): string {
     `你正在一个中文聊天室「${room.config.name}」，类型是「${t.name}」。`,
     "【重要规则】",
     "1. 说话要极度口语化，像真人在微信或群聊里聊天一样。",
-    "2. 严禁输出长篇大论。单次发言控制在 1-2 句话，总字数不超过 40 字。",
+    "2. 严禁输出长篇大论。单次发言控制在 1-2 句话，总字数不超过 30 字。",
     "3. 不要每次都自我介绍，不要说“你好”、“我觉得”等废话，直接进入正题。",
     "4. 语气要自然，多用语气词（如：啊、吧、哈、呢、呃...）。",
     "5. 所有的回复必须是中文。",
@@ -210,7 +210,7 @@ async function generateRoleMessage(params: {
         messages: [
           { 
             role: "system", 
-            content: "你是一个中文聊天室中的角色扮演者。输出必须极度口语化，严禁长篇大论，单次发言不超过40字。" 
+            content: "你是一个中文聊天室中的角色扮演者。输出必须极度口语化，严禁长篇大论，单次发言不超过30字。" 
           },
           { role: "user", content: prompt },
         ],
@@ -319,16 +319,19 @@ function pickNextRole(room: RoomRuntime): RoleCard {
   const last = room.lastSpeakerRoleId;
   const nextInterrupt = room.interruptQueue[0];
 
-  // 如果有被 @ 的角色，优先从中选择
+  // 1. 如果有被 @ 的角色，无视禁言优先从中选择
   if (room.mentionRoleIds.length > 0) {
     const mentioned = active.filter(r => room.mentionRoleIds.includes(r.id));
     if (mentioned.length > 0) {
-      // 从被提到的角色中随机选一个，然后从待选列表中移除（或在发言后移除）
-      const chosen = mentioned[Math.floor(Math.random() * mentioned.length)];
-      // 注意：我们在发言后再从 mentionRoleIds 中移除，或者在这里一次性消费
-      return chosen;
+      return mentioned[Math.floor(Math.random() * mentioned.length)];
     }
   }
+
+  // 2. 过滤掉被禁言的角色
+  const nonMuted = active.filter(r => !room.mutedRoleIds.includes(r.id));
+  
+  // 如果所有人都被禁言了，且没有 @，则没有下一个发言者
+  if (nonMuted.length === 0) return null as any; 
 
   function roleScore(r: RoleCard): number {
     let s = Math.random() * 2.0; // 基础随机性
@@ -391,7 +394,7 @@ async function directorStep(params: {
 }): Promise<DirectorDecision> {
   const { room } = params;
 
-  // 触发停止
+  // 1. 特殊指令：停止
   if (room.turnIndex >= room.config.maxTurns) {
     return {
       nextSpeaker: { type: "narrator" },
@@ -412,6 +415,15 @@ async function directorStep(params: {
       shouldStop: true,
       stopReason: "用户停止",
     };
+  }
+
+  // 2. 特殊指令：禁言/解除禁言 (静默处理)
+  const first = room.interruptQueue[0];
+  if (first?.type === "mute_roles" as any) {
+    room.interruptQueue.shift(); // 消费掉这个插话
+    // 注意：具体逻辑在 pickNextRole 之前已经由 socket 处理或在这里同步
+    // 我们返回一个空决策让循环继续
+    return null as any;
   }
 
   const host = shouldHostIntervene(room);
@@ -449,6 +461,7 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
   io.to(roomId).emit("room.state", {
     roomId,
     running: true,
+    mutedRoleIds: room.mutedRoleIds,
     turnIndex: room.turnIndex,
     name: room.config.name,
     templateId: room.config.templateId,
@@ -457,13 +470,14 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
   while (room.running) {
     if (room.loopToken !== loopToken) break;
 
-    // 如果处于禁言状态，且没有被 @ 的人需要回答，则等待
-    if (room.muted && room.mentionRoleIds.length === 0) {
-      await new Promise((r) => setTimeout(r, 1000));
+    const lastSpeakerIdBeforeStep = room.lastSpeakerRoleId;
+    const decision = await directorStep({ room });
+    
+    // 如果没有下一个发言者（例如所有人都被禁言了）
+    if (!decision || !decision.nextSpeaker || (decision.nextSpeaker.type === 'role' && !decision.nextSpeaker.id)) {
+      await new Promise((r) => setTimeout(r, 1500));
       continue;
     }
-
-    const decision = await directorStep({ room });
     
     // 如果需要停止（如达到上限或用户强制停止）
     if (decision.shouldStop) {
@@ -473,8 +487,17 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
     }
 
     // --- 连发机制重构 ---
-    // 决定当前角色要连发几条消息 (1-3条)，模拟真人群聊习惯
-    const burstCount = Math.floor(Math.random() * 2) + 1; // 1-2条
+    // 决定当前角色要连发几条消息
+    // 权重分配：2-4条 (约80%)，1或5条 (约20%)
+    const getWeightedBurstCount = () => {
+      const rand = Math.random();
+      if (rand < 0.1) return 1; // 10% 概率发1条
+      if (rand < 0.2) return 5; // 10% 概率发5条
+      return Math.floor(Math.random() * 3) + 2; // 80% 概率发2-4条
+    };
+    
+    let burstCount = getWeightedBurstCount();
+    let totalCharsInBurst = 0;
     
     for (let i = 0; i < burstCount; i++) {
       if (!room.running || room.loopToken !== loopToken) break;
@@ -507,10 +530,10 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
         if (!role) break;
 
         // 模拟“正在输入”
-        let thinkingTime = 600 + Math.random() * 1000;
-        // 如果是群聊模块，调慢响应时间
+        let thinkingTime = 400 + Math.random() * 800;
+        // 如果是群聊模块，调慢响应时间，模拟真人在群里看到消息后的反应
         if (room.config.templateId === "group") {
-          thinkingTime += 1500 + Math.random() * 2000;
+          thinkingTime += 1000 + Math.random() * 1500;
         }
         await new Promise((r) => setTimeout(r, thinkingTime));
         if (!room.running) break;
@@ -545,6 +568,17 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 
           m.content = content;
           m.meta = { ...(m.meta ?? {}), ...(meta ?? {}) };
+          
+          // 连发字数关联逻辑：
+          // 如果单句话字数较多（超过 20 字），则减少后续连发概率
+          // 如果当前累积字数已过多，提前结束连发
+          totalCharsInBurst += content.length;
+          if (content.length > 20 && i < burstCount - 1) {
+            // 字数多，有 50% 概率削减剩下的连发
+            if (Math.random() < 0.5) burstCount = i + 1;
+          }
+          if (totalCharsInBurst > 60) break; // 累积字数上限控制
+
           room.lastSpeakerRoleId = role.id;
           
           // 如果该角色是被 @ 的，从列表中移除
@@ -561,7 +595,7 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
         }
 
         // 连发之间的微小停顿
-        await new Promise((r) => setTimeout(r, 400 + Math.random() * 400));
+        await new Promise((r) => setTimeout(r, 200 + Math.random() * 300));
       }
     }
 
@@ -569,6 +603,7 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
     io.to(roomId).emit("room.state", {
       roomId,
       running: room.running,
+      mutedRoleIds: room.mutedRoleIds,
       turnIndex: room.turnIndex,
       name: room.config.name,
       templateId: room.config.templateId,
@@ -578,10 +613,17 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 
     // 换人前的等待：模拟对方阅读和思考
     const lastMsgLen = room.messages[room.messages.length - 1]?.content.length ?? 0;
-    let cooldown = Math.min(3500, 1000 + lastMsgLen * 25); 
-    // 如果是群聊模块，增加等待时间
+    let cooldown = Math.min(2500, 800 + lastMsgLen * 20); 
+
+    // 角色切换检测：如果当前发言者与上一次不同，冷却时间加倍
+    const currentSpeakerId = decision.nextSpeaker.type === "role" ? decision.nextSpeaker.id : undefined;
+    if (currentSpeakerId && lastSpeakerIdBeforeStep && currentSpeakerId !== lastSpeakerIdBeforeStep) {
+      cooldown *= 2;
+    }
+
+    // 如果是群聊模块，额外增加随机等待时间
     if (room.config.templateId === "group") {
-      cooldown += 2000 + Math.random() * 2000;
+      cooldown += 1500 + Math.random() * 1500;
     }
     await new Promise((r) => setTimeout(r, cooldown));
   }
@@ -680,7 +722,7 @@ async function main() {
           summary: "",
           interruptQueue: [],
           running: false,
-          muted: false,
+          mutedRoleIds: [],
           mentionRoleIds: [],
           turnIndex: 0,
         };
@@ -703,7 +745,7 @@ async function main() {
         socket.emit("room.state", {
           roomId: room.id,
           running: room.running,
-          muted: room.muted,
+          mutedRoleIds: room.mutedRoleIds,
           turnIndex: room.turnIndex,
           name: room.config.name,
           templateId: room.config.templateId,
@@ -734,15 +776,23 @@ async function main() {
         ack?.({ ok: true });
       });
 
-      socket.on("room.mute", (data: { roomId: string; muted: boolean }, ack?: (res: unknown) => void) => {
+      socket.on("room.mute", (data: { roomId: string; roleIds: string[]; muted: boolean }, ack?: (res: unknown) => void) => {
         const room = rooms.get(data.roomId);
         if (!room) return ack?.({ ok: false, error: "房间不存在" });
-        room.muted = data.muted;
+        
+        if (data.muted) {
+          // 禁言：加入列表
+          room.mutedRoleIds = [...new Set([...room.mutedRoleIds, ...data.roleIds])];
+        } else {
+          // 解除禁言：从列表移除
+          room.mutedRoleIds = room.mutedRoleIds.filter(id => !data.roleIds.includes(id));
+        }
+
         ack?.({ ok: true });
         io.to(room.id).emit("room.state", {
           roomId: room.id,
           running: room.running,
-          muted: room.muted,
+          mutedRoleIds: room.mutedRoleIds,
           turnIndex: room.turnIndex,
           name: room.config.name,
           templateId: room.config.templateId,
@@ -810,7 +860,14 @@ async function main() {
         if (!check.success) return ack?.({ ok: false, error: check.error.flatten() });
         room.config = merged;
         ack?.({ ok: true, room });
-        io.to(room.id).emit("room.state", { roomId: room.id, running: room.running, turnIndex: room.turnIndex, name: room.config.name, templateId: room.config.templateId });
+        io.to(room.id).emit("room.state", { 
+          roomId: room.id, 
+          running: room.running, 
+          mutedRoleIds: room.mutedRoleIds,
+          turnIndex: room.turnIndex, 
+          name: room.config.name, 
+          templateId: room.config.templateId 
+        });
       });
     });
 

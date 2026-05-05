@@ -10,6 +10,7 @@ export const InterruptTypeSchema = z.enum([
   "add_setting",
   "change_goal",
   "stop",
+  "mute_roles", // 新增：对指定角色禁言/解除禁言
 ]);
 export type InterruptType = z.infer<typeof InterruptTypeSchema>;
 
