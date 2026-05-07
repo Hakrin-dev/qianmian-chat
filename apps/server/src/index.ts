@@ -16,6 +16,8 @@ import {
   UserMessageInputSchema,
 } from "@qianmian/shared";
 import { getRolesByTemplate, ROOM_TEMPLATES, PRESET_ROLES } from "./presets.js";
+import { evolveRelationship, evolveCrossMemory, buildCrossMemoryContext } from "./relationship.js";
+import { saveRoom, loadAllRooms } from "./storage.js";
 
 type SpeakerType = "user" | "role" | "host" | "narrator" | "system";
 
@@ -55,7 +57,7 @@ type InterruptItem = {
   createdAt: number;
 };
 
-type RoomRuntime = {
+export type RoomRuntime = {
   id: string;
   config: {
     name: string;
@@ -67,10 +69,16 @@ type RoomRuntime = {
   };
   messages: ChatMessage[];
   summary: string;
+  relationships: Record<string, {
+    intimacy: number; // 亲密度 0-100
+    dynamicTrait: string; // 动态演化的性格标签
+    memo: string; // 关键记忆点
+  }>;
+  crossMemory: Record<string, Record<string, { content: string; createdAt: number }[]>>;
   interruptQueue: InterruptItem[];
   running: boolean;
-  mutedRoleIds: string[]; // 修改：存储被禁言的角色 ID 列表
-  mentionRoleIds: string[]; 
+  mutedRoleIds: string[];
+  mentionRoleIds: string[];
   turnIndex: number;
   lastSpeakerRoleId?: string;
   loopToken?: string;
@@ -117,7 +125,7 @@ function getRoomWindow(room: RoomRuntime): ChatMessage[] {
 
 function makeRoomSystemRule(room: RoomRuntime): string {
   const t = ROOM_TEMPLATES[room.config.templateId];
-  return [
+  const rules = [
     `你正在一个中文聊天室「${room.config.name}」，类型是「${t.name}」。`,
     "【重要规则】",
     "1. 说话要极度口语化，像真人在微信或群聊里聊天一样。",
@@ -125,7 +133,13 @@ function makeRoomSystemRule(room: RoomRuntime): string {
     "3. 不要每次都自我介绍，不要说“你好”、“我觉得”等废话，直接进入正题。",
     "4. 语气要自然，多用语气词（如：啊、吧、哈、呢、呃...）。",
     "5. 所有的回复必须是中文。",
-  ].join("\n");
+  ];
+
+  if (room.config.templateId === "group") {
+    rules.push("6. 【群聊记忆】在发言时，要敏锐捕捉其他角色的观点。如果其他角色的发言很有趣或有争议，请直接回应、评价或调侃他们，而不是只顾着自己说话。");
+  }
+
+  return rules.join("\n");
 }
 
 function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string): string {
@@ -134,6 +148,14 @@ function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string)
   lines.push("");
   lines.push(`【你的身份】${role.name}`);
   lines.push(role.identity);
+
+  // 注入关系记忆
+  const relation = room.relationships[role.id];
+  if (relation) {
+    lines.push(`【当前关系】亲密度:${relation.intimacy}/100，当前性格特质:${relation.dynamicTrait}`);
+    if (relation.memo) lines.push(`【长期记忆】${relation.memo}`);
+  }
+
   if (role.voice?.tags?.length) lines.push(`【口吻标签】${role.voice.tags.join("、")}`);
   if (role.format) lines.push(`【输出格式】${role.format}`);
   if (role.dos?.length) lines.push(`【必须】${role.dos.join("；")}`);
@@ -144,6 +166,16 @@ function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string)
     lines.push(room.summary.trim());
     lines.push("");
   }
+  // 注入群聊跨角色记忆
+  if (room.config.templateId === "group") {
+    const crossContext = buildCrossMemoryContext(room, role.id);
+    if (crossContext) {
+      lines.push("");
+      lines.push(crossContext);
+      lines.push("");
+    }
+  }
+
   lines.push("【最近对话】");
   for (const m of getRoomWindow(room)) {
     lines.push(`${m.speakerName}：${m.content}`);
@@ -447,6 +479,7 @@ async function directorStep(params: {
   };
 }
 
+// 在模块级保持 rooms 引用
 const rooms = new Map<string, RoomRuntime>();
 
 async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
@@ -585,6 +618,25 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
           room.mentionRoleIds = room.mentionRoleIds.filter(id => id !== role.id);
           
           io.to(roomId).emit("message.done", m);
+
+          // ★ 关系演化：角色发言后更新与用户的关系
+          evolveRelationship(room, role.id, content);
+
+          // ★ 群聊跨角色记忆更新
+          if (room.config.templateId === "group") {
+            const recentWindow = getRoomWindow(room).slice(-6);
+            const recentMsgs = recentWindow.map(msg => ({
+              speakerId: msg.speakerId,
+              speakerName: msg.speakerName,
+              content: msg.content,
+            }));
+            evolveCrossMemory(room, role.id, pickActiveRoles(room), recentMsgs);
+          }
+
+          // 自动保存到磁盘（每隔 3 条消息保存一次，平衡 I/O）
+          if (room.turnIndex % 3 === 0 && i === 0) {
+            saveRoom(room).catch(err => console.error("[AutoSave] Failed:", err));
+          }
         } catch (err: any) {
           if (err.name === 'AbortError') {
              // 正常中断，不报错
@@ -630,6 +682,17 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 }
 
 async function main() {
+  // ★ 启动时从磁盘加载之前保存的房间
+  try {
+    const loaded = await loadAllRooms();
+    for (const [id, room] of loaded) {
+      rooms.set(id, room);
+    }
+    console.log(`[Startup] Loaded ${loaded.size} rooms from disk`);
+  } catch (err) {
+    console.error("[Startup] Failed to load rooms:", err);
+  }
+
   const fastify = Fastify({ 
     logger: true,
     // 显式开启请求日志，帮助排查假死问题
@@ -639,30 +702,65 @@ async function main() {
   // 1. 立即注册路由，确保在任何异步插件挂起前路由已存在
   fastify.get("/health", async () => ({ ok: true, name: "qianmian-server", timestamp: Date.now() }));
   
-  fastify.get("/roles", async (req, reply) => {
+  fastify.get("/rooms/history", async () => {
+    // 简单实现：返回内存中所有已创建的房间概要
+    return Array.from(rooms.values()).map(r => ({
+      id: r.id,
+      name: r.config.name,
+      templateId: r.config.templateId,
+      lastMessage: r.messages[r.messages.length - 1]?.content ?? "新房间",
+      messageCount: r.messages.length,
+      createdAt: r.messages[0]?.createdAt ?? Date.now()
+    })).sort((a, b) => b.createdAt - a.createdAt);
+  });
+  
+  fastify.get("/roles", {
+    schema: {
+      query: {
+        type: "object",
+        properties: {
+          templateId: { type: "string" }
+        }
+      },
+      response: {
+        200: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              name: { type: "string" },
+              avatar: { type: "string" },
+              templateId: { type: "string" },
+              identity: { type: "string" },
+              skills: { type: "array", items: { type: "string" } }
+            }
+          }
+        }
+      }
+    }
+  }, async (req, reply) => {
     const { templateId } = req.query as { templateId?: RoomTemplateId };
     
-    // 使用最基础的 console.log 确保即使 Fastify 挂起也能在终端看到输出
-    // eslint-disable-next-line no-console
-    console.log(`[API] Received /roles request. templateId: ${templateId || 'all'}`);
+    // 角色数据是静态的，设置 1 小时缓存
+    reply.header("Cache-Control", "public, max-age=3600");
 
-    fastify.log.info({ 
-      templateId, 
-      totalPresetRoles: PRESET_ROLES.length 
-    }, "API: Fetching roles");
-    
     try {
-      if (!templateId) return PRESET_ROLES;
-      const filtered = getRolesByTemplate(templateId);
-      
-      if (filtered.length === 0) {
-        fastify.log.warn({ templateId }, "API: No roles found for template, returning all as fallback");
-        return PRESET_ROLES;
-      }
-      return filtered;
+      let list = templateId ? getRolesByTemplate(templateId) : PRESET_ROLES;
+      if (list.length === 0) list = PRESET_ROLES;
+
+      // 仅返回列表渲染所需的精简字段
+      return list.map(r => ({
+        id: r.id,
+        name: r.name,
+        avatar: r.avatar,
+        templateId: r.templateId,
+        identity: r.identity,
+        skills: r.skills
+      }));
     } catch (err) {
       fastify.log.error(err, "API: Error fetching roles");
-      return PRESET_ROLES; // 发生错误时也返回兜底数据
+      return PRESET_ROLES;
     }
   });
 
@@ -720,6 +818,8 @@ async function main() {
           },
           messages: [],
           summary: "",
+          relationships: {},
+          crossMemory: {},
           interruptQueue: [],
           running: false,
           mutedRoleIds: [],
@@ -728,6 +828,9 @@ async function main() {
         };
         rooms.set(id, runtime);
         ack?.({ ok: true, room: runtime });
+
+        // 新房间首次保存
+        saveRoom(runtime).catch(err => console.error("[AutoSave] Failed to save new room:", err));
       });
 
       socket.on("room.join", (data: { roomId: string }, ack?: (res: unknown) => void) => {
@@ -741,7 +844,9 @@ async function main() {
         // 获取当前房间的角色详情
         const roles = pickActiveRoles(room);
         
-        ack?.({ ok: true, room: { ...room, roles } });
+        // 优化：在 join 响应中不返回完整的 messages 列表，messages 会通过 room.messages 事件单独同步
+        const { messages: _, ...roomWithoutMessages } = room;
+        ack?.({ ok: true, room: { ...roomWithoutMessages, roles } });
         socket.emit("room.state", {
           roomId: room.id,
           running: room.running,
@@ -772,7 +877,9 @@ async function main() {
         if (!room) return ack?.({ ok: false, error: "房间不存在" });
         room.running = false;
         room.streamAbort?.abort();
-        room.loopToken = nowId("loop"); 
+        room.loopToken = nowId("loop");
+        // 保存房间当前状态
+        saveRoom(room).catch(err => console.error("[AutoSave] Failed on stop:", err));
         ack?.({ ok: true });
       });
 

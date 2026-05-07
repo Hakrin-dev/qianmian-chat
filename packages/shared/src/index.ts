@@ -90,3 +90,35 @@ export const CreateRoomInputSchema = z.object({
 });
 export type CreateRoomInput = z.infer<typeof CreateRoomInputSchema>;
 
+// ===== 关系/记忆相关类型 =====
+
+/** 角色与用户的关系/性格演化存储 */
+export type RelationshipState = {
+  intimacy: number; // 亲密度 0-100
+  dynamicTrait: string; // 动态演化的性格标签
+  memo: string; // 关键记忆点
+};
+
+/** 跨角色记忆：crossMemory[roleId_A][roleId_B] = 记忆项列表 */
+export type CrossMemoryEntry = {
+  content: string;   // 记忆内容摘要
+  createdAt: number;
+};
+export type CrossMemory = Record<string, Record<string, CrossMemoryEntry[]>>;
+
+/** 关系演化 LLM 返回结果 */
+export const EvolveResultSchema = z.object({
+  intimacyDelta: z.number().min(-10).max(10),
+  newTrait: z.string().min(1),
+  newMemo: z.string().min(1),
+});
+export type EvolveResult = z.infer<typeof EvolveResultSchema>;
+
+/** 跨角色记忆分析 LLM 返回结果 */
+export const CrossMemoryAnalysisSchema = z.object({
+  mentions: z.array(z.object({
+    targetRoleId: z.string().min(1),
+    summary: z.string().min(1),
+  })).default([]),
+});
+export type CrossMemoryAnalysis = z.infer<typeof CrossMemoryAnalysisSchema>;
