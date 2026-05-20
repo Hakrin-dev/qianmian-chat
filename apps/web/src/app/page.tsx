@@ -3,63 +3,47 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { RoleCard, RoomTemplateId } from "@qianmian/shared";
-import { fetchHistory, fetchRoles, type HistoryRoom } from "@/lib/api";
+import { fetchRoles } from "@/lib/api";
 import { getSocket } from "@/lib/socket";
 
 const TEMPLATE_LABEL: Record<RoomTemplateId, string> = {
-  emotional: "情感陪伴",
-  group: "群聊模拟",
-  task: "现实任务",
-};
-
-const TEMPLATE_ICON: Record<RoomTemplateId, string> = {
-  emotional: "💖",
-  group: "👥",
-  task: "🛠️",
-};
-
-const TEMPLATE_CONSTRAINTS: Record<RoomTemplateId, { min: number; max: number; label: string }> = {
-  emotional: { min: 1, max: 2, label: "1-2 个角色" },
-  group: { min: 2, max: 10, label: "2-10 个角色" },
-  task: { min: 1, max: 1, label: "1 个角色" },
+  casual: "闲聊群像",
+  realistic: "现实场景",
+  task: "任务协作",
 };
 
 type CreateRoomAck =
   | { ok: true; room: { id: string } }
   | { ok: false; error?: unknown };
 
+const QUICK_PRESETS: Array<{ label: string; name: string; templateId: RoomTemplateId }> = [
+  { label: "深夜闲聊", name: "深夜闲聊局", templateId: "casual" },
+  { label: "面试模拟", name: "面试模拟（HR + 老师）", templateId: "realistic" },
+  { label: "产品评审", name: "产品评审会", templateId: "task" },
+];
+
 export default function HomePage() {
   const router = useRouter();
-  const [templateId, setTemplateId] = useState<RoomTemplateId>("group");
+  const [templateId, setTemplateId] = useState<RoomTemplateId>("casual");
   const [roomName, setRoomName] = useState("千面聊天室");
   const [roles, setRoles] = useState<RoleCard[]>([]);
-  const [history, setHistory] = useState<HistoryRoom[]>([]);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [rolesLoading, setRolesLoading] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState(false);
 
   const selectedRoleIds = useMemo(
     () => Object.entries(selected).filter(([, v]) => v).map(([k]) => k),
     [selected],
   );
 
-  function loadHistory() {
-    setHistoryLoading(true);
-    fetchHistory()
-      .then(setHistory)
-      .catch(() => {})
-      .finally(() => setHistoryLoading(false));
-  }
-
   function loadRoles() {
     let cancelled = false;
     setError(null);
-    setRolesLoading(true);
+    console.log("Fetching roles for template:", templateId);
     fetchRoles(templateId)
       .then((list) => {
         if (cancelled) return;
+        console.log("Fetched roles:", list.length);
         setRoles(list);
         const next: Record<string, boolean> = {};
         // 自动选中前 3 个
@@ -68,11 +52,9 @@ export default function HomePage() {
       })
       .catch((e: unknown) => {
         if (cancelled) return;
+        console.error("Failed to fetch roles:", e);
         const msg = e instanceof Error ? e.message : "获取角色失败";
         setError(`${msg} (请确认后端服务在 8787 端口运行)`);
-      })
-      .finally(() => {
-        if (!cancelled) setRolesLoading(false);
       });
     return () => {
       cancelled = true;
@@ -80,26 +62,13 @@ export default function HomePage() {
   }
 
   useEffect(() => {
-    loadHistory();
     return loadRoles();
-  }, [templateId]);
-
-  // 当模板切换时，如果当前选择不符合新模板约束，清空选择
-  useEffect(() => {
-    const constraint = TEMPLATE_CONSTRAINTS[templateId];
-    if (selectedRoleIds.length > constraint.max) {
-      setSelected({});
-    }
   }, [templateId]);
 
   async function onCreateRoom() {
     setError(null);
     if (!roomName.trim()) return setError("房间名不能为空");
-    
-    const constraint = TEMPLATE_CONSTRAINTS[templateId];
-    if (selectedRoleIds.length < constraint.min || selectedRoleIds.length > constraint.max) {
-      return setError(`当前模式请选择 ${constraint.label}`);
-    }
+    if (selectedRoleIds.length < 1) return setError("请至少选择 1 个角色");
 
     setLoading(true);
     try {
@@ -137,52 +106,32 @@ export default function HomePage() {
           </p>
         </header>
 
-        <div className="grid gap-6 lg:grid-cols-3">
-          {/* 左侧：历史对话入口 */}
-          <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">历史对话</h2>
-              <button onClick={loadHistory} className="text-xs text-zinc-500 hover:text-zinc-900">刷新</button>
-            </div>
-            <div className="mt-4 space-y-3">
-              {historyLoading ? (
-                <div className="py-10 text-center text-sm text-zinc-400">加载中...</div>
-              ) : history.length === 0 ? (
-                <div className="py-10 text-center text-sm text-zinc-400 italic">暂无历史记录</div>
-              ) : (
-                history.map((h) => (
-                  <button
-                    key={h.id}
-                    onClick={() => router.push(`/room/${encodeURIComponent(h.id)}`)}
-                    className="group w-full rounded-xl border border-zinc-100 p-3 text-left transition-all hover:border-zinc-300 hover:bg-zinc-50"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="text-xs">{TEMPLATE_ICON[h.templateId]}</span>
-                        <div className="truncate text-sm font-medium">{h.name}</div>
-                      </div>
-                      <span className="shrink-0 text-[10px] text-zinc-400 group-hover:text-zinc-600">
-                        {new Date(h.createdAt).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })}
-                      </span>
-                    </div>
-                    <div className="mt-1 line-clamp-1 text-xs text-zinc-500">{h.lastMessage}</div>
-                  </button>
-                ))
-              )}
-            </div>
-          </section>
-
-          {/* 中间：创建房间 */}
+        <div className="grid gap-6 lg:grid-cols-2">
           <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
             <h2 className="text-lg font-semibold">创建房间</h2>
             <div className="mt-4 space-y-4">
+              <div className="flex flex-wrap gap-2">
+                {QUICK_PRESETS.map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    onClick={() => {
+                      setTemplateId(p.templateId);
+                      setRoomName(p.name);
+                    }}
+                    className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50"
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
               <label className="block">
                 <div className="text-sm font-medium text-zinc-700">房间名（中文）</div>
                 <input
                   value={roomName}
                   onChange={(e) => setRoomName(e.target.value)}
                   className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 outline-none focus:border-zinc-400"
-                  placeholder="请输入房间名"
+                  placeholder="例如：周一夜聊 / 面试模拟 / 产品评审"
                 />
               </label>
 
@@ -213,10 +162,9 @@ export default function HomePage() {
             </div>
           </section>
 
-          {/* 右侧：选择角色 */}
           <section className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">选择角色（{TEMPLATE_CONSTRAINTS[templateId].label}）</h2>
+              <h2 className="text-lg font-semibold">选择角色（建议 3-6 个）</h2>
               <button
                 onClick={() => loadRoles()}
                 className="text-xs text-zinc-500 hover:text-zinc-900"
@@ -225,19 +173,9 @@ export default function HomePage() {
               </button>
             </div>
             <p className="mt-1 text-xs text-zinc-600">当前已选：{selectedRoleIds.length} 个</p>
-            <div className="mt-4 grid gap-3">
-              {rolesLoading ? (
-                Array.from({ length: 4 }).map((_, i) => (
-                  <div key={i} className="flex animate-pulse items-start gap-3 rounded-xl border border-zinc-100 p-3">
-                    <div className="h-5 w-5 rounded bg-zinc-100" />
-                    <div className="flex-1 space-y-2">
-                      <div className="h-4 w-1/2 rounded bg-zinc-100" />
-                      <div className="h-3 w-full rounded bg-zinc-100" />
-                    </div>
-                  </div>
-                ))
-              ) : roles.length === 0 ? (
-                <div className="py-10 text-center text-sm text-zinc-500">
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              {roles.length === 0 ? (
+                <div className="col-span-2 py-10 text-center text-sm text-zinc-500">
                   {error ? `加载失败: ${error}` : "未找到角色，请检查服务器是否已启动。"}
                 </div>
               ) : (
@@ -263,7 +201,19 @@ export default function HomePage() {
                         <span className="text-lg">{r.avatar || "👤"}</span>
                         <div className="truncate text-sm font-semibold">{r.name}</div>
                       </div>
-                      <div className="mt-1 line-clamp-1 text-xs text-zinc-600">{r.identity}</div>
+                      <div className="mt-1 line-clamp-2 text-xs text-zinc-600">{r.identity}</div>
+                      {r.skills?.length ? (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {r.skills.slice(0, 2).map((s) => (
+                            <span
+                              key={s}
+                              className="rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-600"
+                            >
+                              {s}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   </label>
                 ))

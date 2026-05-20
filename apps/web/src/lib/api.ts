@@ -10,18 +10,3 @@ export async function fetchRoles(templateId?: RoomTemplateId): Promise<RoleCard[
   return (await res.json()) as RoleCard[];
 }
 
-export type HistoryRoom = {
-  id: string;
-  name: string;
-  templateId: RoomTemplateId;
-  lastMessage: string;
-  messageCount: number;
-  createdAt: number;
-};
-
-export async function fetchHistory(): Promise<HistoryRoom[]> {
-  const res = await fetch(`${SERVER_URL}/rooms/history`, { cache: "no-store" });
-  if (!res.ok) throw new Error("获取历史对话失败");
-  return res.json();
-}
-

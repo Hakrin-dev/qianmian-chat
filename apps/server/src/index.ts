@@ -16,8 +16,6 @@ import {
   UserMessageInputSchema,
 } from "@qianmian/shared";
 import { getRolesByTemplate, ROOM_TEMPLATES, PRESET_ROLES } from "./presets.js";
-import { evolveRelationship, evolveCrossMemory, buildCrossMemoryContext } from "./relationship.js";
-import { saveRoom, loadAllRooms } from "./storage.js";
 
 type SpeakerType = "user" | "role" | "host" | "narrator" | "system";
 
@@ -57,7 +55,7 @@ type InterruptItem = {
   createdAt: number;
 };
 
-export type RoomRuntime = {
+type RoomRuntime = {
   id: string;
   config: {
     name: string;
@@ -69,16 +67,8 @@ export type RoomRuntime = {
   };
   messages: ChatMessage[];
   summary: string;
-  relationships: Record<string, {
-    intimacy: number; // 亲密度 0-100
-    dynamicTrait: string; // 动态演化的性格标签
-    memo: string; // 关键记忆点
-  }>;
-  crossMemory: Record<string, Record<string, { content: string; createdAt: number }[]>>;
   interruptQueue: InterruptItem[];
   running: boolean;
-  mutedRoleIds: string[];
-  mentionRoleIds: string[];
   turnIndex: number;
   lastSpeakerRoleId?: string;
   loopToken?: string;
@@ -125,21 +115,15 @@ function getRoomWindow(room: RoomRuntime): ChatMessage[] {
 
 function makeRoomSystemRule(room: RoomRuntime): string {
   const t = ROOM_TEMPLATES[room.config.templateId];
-  const rules = [
+  return [
     `你正在一个中文聊天室「${room.config.name}」，类型是「${t.name}」。`,
     "【重要规则】",
     "1. 说话要极度口语化，像真人在微信或群聊里聊天一样。",
-    "2. 严禁输出长篇大论。单次发言控制在 1-2 句话，总字数不超过 30 字。",
+    "2. 严禁输出长篇大论。单次发言控制在 1-2 句话，总字数不超过 40 字。",
     "3. 不要每次都自我介绍，不要说“你好”、“我觉得”等废话，直接进入正题。",
     "4. 语气要自然，多用语气词（如：啊、吧、哈、呢、呃...）。",
     "5. 所有的回复必须是中文。",
-  ];
-
-  if (room.config.templateId === "group") {
-    rules.push("6. 【群聊记忆】在发言时，要敏锐捕捉其他角色的观点。如果其他角色的发言很有趣或有争议，请直接回应、评价或调侃他们，而不是只顾着自己说话。");
-  }
-
-  return rules.join("\n");
+  ].join("\n");
 }
 
 function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string): string {
@@ -148,14 +132,6 @@ function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string)
   lines.push("");
   lines.push(`【你的身份】${role.name}`);
   lines.push(role.identity);
-
-  // 注入关系记忆
-  const relation = room.relationships[role.id];
-  if (relation) {
-    lines.push(`【当前关系】亲密度:${relation.intimacy}/100，当前性格特质:${relation.dynamicTrait}`);
-    if (relation.memo) lines.push(`【长期记忆】${relation.memo}`);
-  }
-
   if (role.voice?.tags?.length) lines.push(`【口吻标签】${role.voice.tags.join("、")}`);
   if (role.format) lines.push(`【输出格式】${role.format}`);
   if (role.dos?.length) lines.push(`【必须】${role.dos.join("；")}`);
@@ -166,16 +142,6 @@ function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string)
     lines.push(room.summary.trim());
     lines.push("");
   }
-  // 注入群聊跨角色记忆
-  if (room.config.templateId === "group") {
-    const crossContext = buildCrossMemoryContext(room, role.id);
-    if (crossContext) {
-      lines.push("");
-      lines.push(crossContext);
-      lines.push("");
-    }
-  }
-
   lines.push("【最近对话】");
   for (const m of getRoomWindow(room)) {
     lines.push(`${m.speakerName}：${m.content}`);
@@ -242,7 +208,7 @@ async function generateRoleMessage(params: {
         messages: [
           { 
             role: "system", 
-            content: "你是一个中文聊天室中的角色扮演者。输出必须极度口语化，严禁长篇大论，单次发言不超过30字。" 
+            content: "你是一个中文聊天室中的角色扮演者。输出必须极度口语化，严禁长篇大论，单次发言不超过40字。" 
           },
           { role: "user", content: prompt },
         ],
@@ -337,10 +303,10 @@ function computeInstruction(room: RoomRuntime, role: RoleCard): string {
   }
 
   // 常规推进逻辑
-  if (t === "task") {
+  if (t === "realistic") {
     return "请根据当前场景，用专业口吻给出一个具体的、可操作的推进点，并抛出一个澄清问题。";
   }
-  if (t === "group") {
+  if (t === "task") {
     return "请针对当前任务进度，给出一个实质性的建议或指出一个潜在风险，并询问其他角色的看法。";
   }
   return "请接住上一条对话的梗或话题点，用你的独特口吻发表见解，并抛出一个开放性问题。";
@@ -350,20 +316,6 @@ function pickNextRole(room: RoomRuntime): RoleCard {
   const active = pickActiveRoles(room);
   const last = room.lastSpeakerRoleId;
   const nextInterrupt = room.interruptQueue[0];
-
-  // 1. 如果有被 @ 的角色，无视禁言优先从中选择
-  if (room.mentionRoleIds.length > 0) {
-    const mentioned = active.filter(r => room.mentionRoleIds.includes(r.id));
-    if (mentioned.length > 0) {
-      return mentioned[Math.floor(Math.random() * mentioned.length)];
-    }
-  }
-
-  // 2. 过滤掉被禁言的角色
-  const nonMuted = active.filter(r => !room.mutedRoleIds.includes(r.id));
-  
-  // 如果所有人都被禁言了，且没有 @，则没有下一个发言者
-  if (nonMuted.length === 0) return null as any; 
 
   function roleScore(r: RoleCard): number {
     let s = Math.random() * 2.0; // 基础随机性
@@ -426,7 +378,7 @@ async function directorStep(params: {
 }): Promise<DirectorDecision> {
   const { room } = params;
 
-  // 1. 特殊指令：停止
+  // 触发停止
   if (room.turnIndex >= room.config.maxTurns) {
     return {
       nextSpeaker: { type: "narrator" },
@@ -449,24 +401,15 @@ async function directorStep(params: {
     };
   }
 
-  // 2. 特殊指令：禁言/解除禁言 (静默处理)
-  const first = room.interruptQueue[0];
-  if (first?.type === "mute_roles" as any) {
-    room.interruptQueue.shift(); // 消费掉这个插话
-    // 注意：具体逻辑在 pickNextRole 之前已经由 socket 处理或在这里同步
-    // 我们返回一个空决策让循环继续
-    return null as any;
-  }
-
   const host = shouldHostIntervene(room);
   if (host) {
     return {
-        nextSpeaker: { type: "narrator" },
-        intent: "transition",
-        phase: room.config.templateId === "task" ? "clarify" : "free",
-        instruction: "大家好，欢迎来到这个聊天室。我们先围绕目标开始聊聊吧，谁先起个头？",
-        shouldStop: false,
-      };
+      nextSpeaker: { type: "narrator" },
+      intent: "transition",
+      phase: room.config.templateId === "realistic" ? "clarify" : "free",
+      instruction: "大家好，欢迎来到这个聊天室。我们先围绕目标开始聊聊吧，谁先起个头？",
+      shouldStop: false,
+    };
   }
 
   const role = pickNextRole(room);
@@ -479,7 +422,6 @@ async function directorStep(params: {
   };
 }
 
-// 在模块级保持 rooms 引用
 const rooms = new Map<string, RoomRuntime>();
 
 async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
@@ -494,7 +436,6 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
   io.to(roomId).emit("room.state", {
     roomId,
     running: true,
-    mutedRoleIds: room.mutedRoleIds,
     turnIndex: room.turnIndex,
     name: room.config.name,
     templateId: room.config.templateId,
@@ -503,14 +444,7 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
   while (room.running) {
     if (room.loopToken !== loopToken) break;
 
-    const lastSpeakerIdBeforeStep = room.lastSpeakerRoleId;
     const decision = await directorStep({ room });
-    
-    // 如果没有下一个发言者（例如所有人都被禁言了）
-    if (!decision || !decision.nextSpeaker || (decision.nextSpeaker.type === 'role' && !decision.nextSpeaker.id)) {
-      await new Promise((r) => setTimeout(r, 1500));
-      continue;
-    }
     
     // 如果需要停止（如达到上限或用户强制停止）
     if (decision.shouldStop) {
@@ -520,17 +454,8 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
     }
 
     // --- 连发机制重构 ---
-    // 决定当前角色要连发几条消息
-    // 权重分配：2-4条 (约80%)，1或5条 (约20%)
-    const getWeightedBurstCount = () => {
-      const rand = Math.random();
-      if (rand < 0.1) return 1; // 10% 概率发1条
-      if (rand < 0.2) return 5; // 10% 概率发5条
-      return Math.floor(Math.random() * 3) + 2; // 80% 概率发2-4条
-    };
-    
-    let burstCount = getWeightedBurstCount();
-    let totalCharsInBurst = 0;
+    // 决定当前角色要连发几条消息 (1-3条)，模拟真人群聊习惯
+    const burstCount = Math.floor(Math.random() * 2) + 1; // 1-2条
     
     for (let i = 0; i < burstCount; i++) {
       if (!room.running || room.loopToken !== loopToken) break;
@@ -563,11 +488,7 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
         if (!role) break;
 
         // 模拟“正在输入”
-        let thinkingTime = 400 + Math.random() * 800;
-        // 如果是群聊模块，调慢响应时间，模拟真人在群里看到消息后的反应
-        if (room.config.templateId === "group") {
-          thinkingTime += 1000 + Math.random() * 1500;
-        }
+        const thinkingTime = 600 + Math.random() * 1000;
         await new Promise((r) => setTimeout(r, thinkingTime));
         if (!room.running) break;
 
@@ -601,42 +522,8 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 
           m.content = content;
           m.meta = { ...(m.meta ?? {}), ...(meta ?? {}) };
-          
-          // 连发字数关联逻辑：
-          // 如果单句话字数较多（超过 20 字），则减少后续连发概率
-          // 如果当前累积字数已过多，提前结束连发
-          totalCharsInBurst += content.length;
-          if (content.length > 20 && i < burstCount - 1) {
-            // 字数多，有 50% 概率削减剩下的连发
-            if (Math.random() < 0.5) burstCount = i + 1;
-          }
-          if (totalCharsInBurst > 60) break; // 累积字数上限控制
-
           room.lastSpeakerRoleId = role.id;
-          
-          // 如果该角色是被 @ 的，从列表中移除
-          room.mentionRoleIds = room.mentionRoleIds.filter(id => id !== role.id);
-          
           io.to(roomId).emit("message.done", m);
-
-          // ★ 关系演化：角色发言后更新与用户的关系
-          evolveRelationship(room, role.id, content);
-
-          // ★ 群聊跨角色记忆更新
-          if (room.config.templateId === "group") {
-            const recentWindow = getRoomWindow(room).slice(-6);
-            const recentMsgs = recentWindow.map(msg => ({
-              speakerId: msg.speakerId,
-              speakerName: msg.speakerName,
-              content: msg.content,
-            }));
-            evolveCrossMemory(room, role.id, pickActiveRoles(room), recentMsgs);
-          }
-
-          // 自动保存到磁盘（每隔 3 条消息保存一次，平衡 I/O）
-          if (room.turnIndex % 3 === 0 && i === 0) {
-            saveRoom(room).catch(err => console.error("[AutoSave] Failed:", err));
-          }
         } catch (err: any) {
           if (err.name === 'AbortError') {
              // 正常中断，不报错
@@ -647,7 +534,7 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
         }
 
         // 连发之间的微小停顿
-        await new Promise((r) => setTimeout(r, 200 + Math.random() * 300));
+        await new Promise((r) => setTimeout(r, 400 + Math.random() * 400));
       }
     }
 
@@ -655,7 +542,6 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
     io.to(roomId).emit("room.state", {
       roomId,
       running: room.running,
-      mutedRoleIds: room.mutedRoleIds,
       turnIndex: room.turnIndex,
       name: room.config.name,
       templateId: room.config.templateId,
@@ -665,34 +551,12 @@ async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
 
     // 换人前的等待：模拟对方阅读和思考
     const lastMsgLen = room.messages[room.messages.length - 1]?.content.length ?? 0;
-    let cooldown = Math.min(2500, 800 + lastMsgLen * 20); 
-
-    // 角色切换检测：如果当前发言者与上一次不同，冷却时间加倍
-    const currentSpeakerId = decision.nextSpeaker.type === "role" ? decision.nextSpeaker.id : undefined;
-    if (currentSpeakerId && lastSpeakerIdBeforeStep && currentSpeakerId !== lastSpeakerIdBeforeStep) {
-      cooldown *= 2;
-    }
-
-    // 如果是群聊模块，额外增加随机等待时间
-    if (room.config.templateId === "group") {
-      cooldown += 1500 + Math.random() * 1500;
-    }
+    const cooldown = Math.min(3500, 1000 + lastMsgLen * 25); 
     await new Promise((r) => setTimeout(r, cooldown));
   }
 }
 
 async function main() {
-  // ★ 启动时从磁盘加载之前保存的房间
-  try {
-    const loaded = await loadAllRooms();
-    for (const [id, room] of loaded) {
-      rooms.set(id, room);
-    }
-    console.log(`[Startup] Loaded ${loaded.size} rooms from disk`);
-  } catch (err) {
-    console.error("[Startup] Failed to load rooms:", err);
-  }
-
   const fastify = Fastify({ 
     logger: true,
     // 显式开启请求日志，帮助排查假死问题
@@ -702,65 +566,30 @@ async function main() {
   // 1. 立即注册路由，确保在任何异步插件挂起前路由已存在
   fastify.get("/health", async () => ({ ok: true, name: "qianmian-server", timestamp: Date.now() }));
   
-  fastify.get("/rooms/history", async () => {
-    // 简单实现：返回内存中所有已创建的房间概要
-    return Array.from(rooms.values()).map(r => ({
-      id: r.id,
-      name: r.config.name,
-      templateId: r.config.templateId,
-      lastMessage: r.messages[r.messages.length - 1]?.content ?? "新房间",
-      messageCount: r.messages.length,
-      createdAt: r.messages[0]?.createdAt ?? Date.now()
-    })).sort((a, b) => b.createdAt - a.createdAt);
-  });
-  
-  fastify.get("/roles", {
-    schema: {
-      query: {
-        type: "object",
-        properties: {
-          templateId: { type: "string" }
-        }
-      },
-      response: {
-        200: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              name: { type: "string" },
-              avatar: { type: "string" },
-              templateId: { type: "string" },
-              identity: { type: "string" },
-              skills: { type: "array", items: { type: "string" } }
-            }
-          }
-        }
-      }
-    }
-  }, async (req, reply) => {
+  fastify.get("/roles", async (req, reply) => {
     const { templateId } = req.query as { templateId?: RoomTemplateId };
     
-    // 角色数据是静态的，设置 1 小时缓存
-    reply.header("Cache-Control", "public, max-age=3600");
+    // 使用最基础的 console.log 确保即使 Fastify 挂起也能在终端看到输出
+    // eslint-disable-next-line no-console
+    console.log(`[API] Received /roles request. templateId: ${templateId || 'all'}`);
 
+    fastify.log.info({ 
+      templateId, 
+      totalPresetRoles: PRESET_ROLES.length 
+    }, "API: Fetching roles");
+    
     try {
-      let list = templateId ? getRolesByTemplate(templateId) : PRESET_ROLES;
-      if (list.length === 0) list = PRESET_ROLES;
-
-      // 仅返回列表渲染所需的精简字段
-      return list.map(r => ({
-        id: r.id,
-        name: r.name,
-        avatar: r.avatar,
-        templateId: r.templateId,
-        identity: r.identity,
-        skills: r.skills
-      }));
+      if (!templateId) return PRESET_ROLES;
+      const filtered = getRolesByTemplate(templateId);
+      
+      if (filtered.length === 0) {
+        fastify.log.warn({ templateId }, "API: No roles found for template, returning all as fallback");
+        return PRESET_ROLES;
+      }
+      return filtered;
     } catch (err) {
       fastify.log.error(err, "API: Error fetching roles");
-      return PRESET_ROLES;
+      return PRESET_ROLES; // 发生错误时也返回兜底数据
     }
   });
 
@@ -792,19 +621,6 @@ async function main() {
           return;
         }
         const cfg = parsed.data;
-
-        // 服务端校验角色数量约束
-        const roleCount = cfg.selectedRoleIds.length;
-        if (cfg.templateId === "emotional" && (roleCount < 1 || roleCount > 2)) {
-          return ack?.({ ok: false, error: "情感陪伴模式请选择 1-2 个角色" });
-        }
-        if (cfg.templateId === "group" && (roleCount < 2 || roleCount > 10)) {
-          return ack?.({ ok: false, error: "群聊模拟模式请选择 2-10 个角色" });
-        }
-        if (cfg.templateId === "task" && roleCount !== 1) {
-          return ack?.({ ok: false, error: "现实任务模式请选择 1 个角色" });
-        }
-
         const id = nowId("room");
         const runtime: RoomRuntime = {
           id,
@@ -813,24 +629,17 @@ async function main() {
             templateId: cfg.templateId,
             selectedRoleIds: cfg.selectedRoleIds,
             activeRoleIds: cfg.selectedRoleIds.slice(0, Math.min(6, cfg.selectedRoleIds.length)),
-            maxTurns: cfg.templateId === "emotional" ? 30 : cfg.templateId === "group" ? 24 : 18,
+            maxTurns: cfg.templateId === "casual" ? 30 : cfg.templateId === "realistic" ? 16 : 18,
             windowSize: 20,
           },
           messages: [],
           summary: "",
-          relationships: {},
-          crossMemory: {},
           interruptQueue: [],
           running: false,
-          mutedRoleIds: [],
-          mentionRoleIds: [],
           turnIndex: 0,
         };
         rooms.set(id, runtime);
         ack?.({ ok: true, room: runtime });
-
-        // 新房间首次保存
-        saveRoom(runtime).catch(err => console.error("[AutoSave] Failed to save new room:", err));
       });
 
       socket.on("room.join", (data: { roomId: string }, ack?: (res: unknown) => void) => {
@@ -840,17 +649,10 @@ async function main() {
           return;
         }
         socket.join(room.id);
-        
-        // 获取当前房间的角色详情
-        const roles = pickActiveRoles(room);
-        
-        // 优化：在 join 响应中不返回完整的 messages 列表，messages 会通过 room.messages 事件单独同步
-        const { messages: _, ...roomWithoutMessages } = room;
-        ack?.({ ok: true, room: { ...roomWithoutMessages, roles } });
+        ack?.({ ok: true, room });
         socket.emit("room.state", {
           roomId: room.id,
           running: room.running,
-          mutedRoleIds: room.mutedRoleIds,
           turnIndex: room.turnIndex,
           name: room.config.name,
           templateId: room.config.templateId,
@@ -877,33 +679,8 @@ async function main() {
         if (!room) return ack?.({ ok: false, error: "房间不存在" });
         room.running = false;
         room.streamAbort?.abort();
-        room.loopToken = nowId("loop");
-        // 保存房间当前状态
-        saveRoom(room).catch(err => console.error("[AutoSave] Failed on stop:", err));
+        room.loopToken = nowId("loop"); 
         ack?.({ ok: true });
-      });
-
-      socket.on("room.mute", (data: { roomId: string; roleIds: string[]; muted: boolean }, ack?: (res: unknown) => void) => {
-        const room = rooms.get(data.roomId);
-        if (!room) return ack?.({ ok: false, error: "房间不存在" });
-        
-        if (data.muted) {
-          // 禁言：加入列表
-          room.mutedRoleIds = [...new Set([...room.mutedRoleIds, ...data.roleIds])];
-        } else {
-          // 解除禁言：从列表移除
-          room.mutedRoleIds = room.mutedRoleIds.filter(id => !data.roleIds.includes(id));
-        }
-
-        ack?.({ ok: true });
-        io.to(room.id).emit("room.state", {
-          roomId: room.id,
-          running: room.running,
-          mutedRoleIds: room.mutedRoleIds,
-          turnIndex: room.turnIndex,
-          name: room.config.name,
-          templateId: room.config.templateId,
-        });
       });
 
       socket.on("user.message", (input, ack?: (res: unknown) => void) => {
@@ -944,11 +721,6 @@ async function main() {
         };
         enqueueInterrupt(room, item);
         
-        // 处理 @ 提到的人
-        if (data.mentionRoleIds && data.mentionRoleIds.length > 0) {
-          room.mentionRoleIds = [...new Set([...room.mentionRoleIds, ...data.mentionRoleIds])];
-        }
-
         // 如果用户发了消息，强制中断当前 LLM 流（如果正在运行）
         if (room.running && room.streamAbort) {
           room.streamAbort.abort();
@@ -967,14 +739,7 @@ async function main() {
         if (!check.success) return ack?.({ ok: false, error: check.error.flatten() });
         room.config = merged;
         ack?.({ ok: true, room });
-        io.to(room.id).emit("room.state", { 
-          roomId: room.id, 
-          running: room.running, 
-          mutedRoleIds: room.mutedRoleIds,
-          turnIndex: room.turnIndex, 
-          name: room.config.name, 
-          templateId: room.config.templateId 
-        });
+        io.to(room.id).emit("room.state", { roomId: room.id, running: room.running, turnIndex: room.turnIndex, name: room.config.name, templateId: room.config.templateId });
       });
     });
 

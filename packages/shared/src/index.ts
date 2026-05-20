@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const RoomTemplateIdSchema = z.enum(["emotional", "group", "task"]);
+export const RoomTemplateIdSchema = z.enum(["casual", "realistic", "task"]);
 export type RoomTemplateId = z.infer<typeof RoomTemplateIdSchema>;
 
 export const InterruptTypeSchema = z.enum([
@@ -10,7 +10,6 @@ export const InterruptTypeSchema = z.enum([
   "add_setting",
   "change_goal",
   "stop",
-  "mute_roles", // 新增：对指定角色禁言/解除禁言
 ]);
 export type InterruptType = z.infer<typeof InterruptTypeSchema>;
 
@@ -79,7 +78,6 @@ export const UserMessageInputSchema = z.object({
   roomId: z.string().min(1),
   content: z.string().min(1).max(1000),
   interruptType: InterruptTypeSchema.default("ask"),
-  mentionRoleIds: z.array(z.string()).optional(),
 });
 export type UserMessageInput = z.infer<typeof UserMessageInputSchema>;
 
@@ -90,35 +88,3 @@ export const CreateRoomInputSchema = z.object({
 });
 export type CreateRoomInput = z.infer<typeof CreateRoomInputSchema>;
 
-// ===== 关系/记忆相关类型 =====
-
-/** 角色与用户的关系/性格演化存储 */
-export type RelationshipState = {
-  intimacy: number; // 亲密度 0-100
-  dynamicTrait: string; // 动态演化的性格标签
-  memo: string; // 关键记忆点
-};
-
-/** 跨角色记忆：crossMemory[roleId_A][roleId_B] = 记忆项列表 */
-export type CrossMemoryEntry = {
-  content: string;   // 记忆内容摘要
-  createdAt: number;
-};
-export type CrossMemory = Record<string, Record<string, CrossMemoryEntry[]>>;
-
-/** 关系演化 LLM 返回结果 */
-export const EvolveResultSchema = z.object({
-  intimacyDelta: z.number().min(-10).max(10),
-  newTrait: z.string().min(1),
-  newMemo: z.string().min(1),
-});
-export type EvolveResult = z.infer<typeof EvolveResultSchema>;
-
-/** 跨角色记忆分析 LLM 返回结果 */
-export const CrossMemoryAnalysisSchema = z.object({
-  mentions: z.array(z.object({
-    targetRoleId: z.string().min(1),
-    summary: z.string().min(1),
-  })).default([]),
-});
-export type CrossMemoryAnalysis = z.infer<typeof CrossMemoryAnalysisSchema>;
