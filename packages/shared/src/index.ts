@@ -10,7 +10,8 @@ export const InterruptTypeSchema = z.enum([
   "add_setting",
   "change_goal",
   "stop",
-  "mute_roles", // 新增：对指定角色禁言/解除禁言
+  "mute_roles",
+  "regulate_roles", // 情感调节：用滑块调节角色个性维度
 ]);
 export type InterruptType = z.infer<typeof InterruptTypeSchema>;
 
@@ -122,3 +123,58 @@ export const CrossMemoryAnalysisSchema = z.object({
   })).default([]),
 });
 export type CrossMemoryAnalysis = z.infer<typeof CrossMemoryAnalysisSchema>;
+
+// ===== 情感调节相关类型 =====
+
+/** 自定义维度元数据 */
+export type CustomDimensionMeta = {
+  key: string;
+  label: string;
+  low: string;
+  high: string;
+};
+
+/** 单个角色的调节维度值 (0-100) */
+export const RegulateDimensionsSchema = z.object({
+  creativity: z.number().min(0).max(100),
+  talkativeness: z.number().min(0).max(100),
+  emotional: z.number().min(0).max(100),
+  cooperativeness: z.number().min(0).max(100),
+  seriousness: z.number().min(0).max(100),
+  custom: z.record(z.string(), z.number().min(0).max(100)).default({}),
+});
+export type RegulateDimensions = z.infer<typeof RegulateDimensionsSchema>;
+
+/** 房间内各角色的调节配置 */
+export type RegulateConfig = Record<string, RegulateDimensions>;
+
+// ===== 角色创建相关类型 =====
+
+/** LLM 分析 prompt 后返回的角色建议 */
+export const RoleAnalysisSchema = z.object({
+  name: z.string().min(1),
+  avatar: z.string().min(1),
+  templateId: RoomTemplateIdSchema,
+  identity: z.string().min(1),
+  voice: z.object({
+    tags: z.array(z.string().min(1)),
+    examples: z.array(z.string().min(1)).max(3),
+  }),
+  dos: z.array(z.string().min(1)),
+  donts: z.array(z.string().min(1)),
+  format: z.string().min(1),
+  skills: z.array(z.string().min(1)),
+  parameters: z.object({
+    temperature: z.number().min(0).max(2),
+    max_tokens: z.number().int().min(16).max(2048),
+  }),
+  regulateDimensions: RegulateDimensionsSchema,
+});
+export type RoleAnalysis = z.infer<typeof RoleAnalysisSchema>;
+
+/** 创建角色请求 */
+export const CreateCustomRoleInputSchema = z.object({
+  prompt: z.string().min(1).max(2000),
+  role: RoleAnalysisSchema,
+});
+export type CreateCustomRoleInput = z.infer<typeof CreateCustomRoleInputSchema>;

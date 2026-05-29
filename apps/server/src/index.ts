@@ -10,14 +10,17 @@ import {
   type DirectorDecision,
   DirectorDecisionSchema,
   type InterruptType,
+  type RegulateDimensions,
   type RoleCard,
   RoomConfigSchema,
   type RoomTemplateId,
   UserMessageInputSchema,
+  CreateCustomRoleInputSchema,
 } from "@qianmian/shared";
 import { getRolesByTemplate, ROOM_TEMPLATES, PRESET_ROLES } from "./presets.js";
 import { evolveRelationship, evolveCrossMemory, buildCrossMemoryContext } from "./relationship.js";
-import { saveRoom, loadAllRooms } from "./storage.js";
+import { analyzePromptForRole, analysisToRoleCard, loadCustomRoles, saveCustomRole, deleteCustomRole } from "./roleFactory.js";
+import { saveRoom, loadAllRooms, deleteRoomFile } from "./storage.js";
 
 type SpeakerType = "user" | "role" | "host" | "narrator" | "system";
 
@@ -78,6 +81,7 @@ export type RoomRuntime = {
   interruptQueue: InterruptItem[];
   running: boolean;
   mutedRoleIds: string[];
+  regulateConfig: Record<string, RegulateDimensions>;
   mentionRoleIds: string[];
   turnIndex: number;
   lastSpeakerRoleId?: string;
@@ -114,7 +118,8 @@ function nowId(prefix: string) {
 }
 
 function pickActiveRoles(room: RoomRuntime): RoleCard[] {
-  const map = new Map(PRESET_ROLES.map((r) => [r.id, r]));
+  const allRoles = [...PRESET_ROLES, ...customRolesCache];
+  const map = new Map(allRoles.map((r) => [r.id, r]));
   return room.config.activeRoleIds.map((id) => map.get(id)).filter(Boolean) as RoleCard[];
 }
 
@@ -154,6 +159,33 @@ function buildRolePrompt(room: RoomRuntime, role: RoleCard, instruction: string)
   if (relation) {
     lines.push(`【当前关系】亲密度:${relation.intimacy}/100，当前性格特质:${relation.dynamicTrait}`);
     if (relation.memo) lines.push(`【长期记忆】${relation.memo}`);
+  }
+
+  // 注入情感调节指令
+  const regulate = room.regulateConfig[role.id];
+  if (regulate) {
+    const regRules: string[] = [];
+    if (regulate.creativity <= 30) regRules.push("保持务实、脚踏实地的思考方式，避免天马行空的想象");
+    else if (regulate.creativity >= 70) regRules.push("大胆发挥想象力，脑洞大开，用跳跃性思维连接看似无关的概念");
+    if (regulate.talkativeness <= 30) regRules.push("保持沉默寡言，尽量用最简短的文字回应，能少说就少说");
+    else if (regulate.talkativeness >= 70) regRules.push("积极发言，多说细节和感受，主动拓展话题");
+    if (regulate.emotional <= 30) regRules.push("保持冷静理性，用客观陈述代替情感表达，不流露个人情绪");
+    else if (regulate.emotional >= 70) regRules.push("情感表达要丰富热烈，多用感叹和情绪化表达，让文字充满感染力");
+    if (regulate.cooperativeness <= 30) regRules.push("保持高冷疏离的态度，不轻易认同他人，坚持自己的立场");
+    else if (regulate.cooperativeness >= 70) regRules.push("积极认同和配合他人的观点，制造和谐友善的对话氛围");
+    if (regulate.seriousness <= 30) regRules.push("语气温和友善，避免尖锐批评，多用鼓励和肯定的话语");
+    else if (regulate.seriousness >= 70) regRules.push("直言不讳，一针见血地指出问题所在，不怕挑战和质疑");
+    // 自定义维度
+    if (regulate.custom) {
+      for (const [key, val] of Object.entries(regulate.custom)) {
+        if (val <= 30) regRules.push(`${key}：保持较低水平`);
+        else if (val >= 70) regRules.push(`${key}：保持较高水平`);
+      }
+    }
+    if (regRules.length > 0) {
+      lines.push("【个性调节】");
+      lines.push(...regRules);
+    }
   }
 
   if (role.voice?.tags?.length) lines.push(`【口吻标签】${role.voice.tags.join("、")}`);
@@ -246,9 +278,23 @@ async function generateRoleMessage(params: {
           },
           { role: "user", content: prompt },
         ],
-        temperature: role.parameters?.temperature ?? 0.8,
+        temperature: (() => {
+          const base = role.parameters?.temperature ?? 0.8;
+          const reg = room.regulateConfig[role.id];
+          if (!reg) return base;
+          // creativity 映射到 temperature: 0→0.3, 50→base, 100→1.8
+          const t = reg.creativity / 100;
+          return 0.3 + t * 1.5;
+        })(),
         top_p: role.parameters?.top_p ?? 1,
-        max_tokens: role.parameters?.max_tokens ?? 150, // 降低 max_tokens 强制短输出
+        max_tokens: (() => {
+          const base = role.parameters?.max_tokens ?? 150;
+          const reg = room.regulateConfig[role.id];
+          if (!reg) return base;
+          // talkativeness 映射到 max_tokens: 0→40, 50→base, 100→300
+          const t = reg.talkativeness / 100;
+          return Math.round(40 + t * 260);
+        })(),
         stream: true,
       },
       { signal: room.streamAbort.signal },
@@ -287,6 +333,7 @@ function interruptPriority(type: InterruptType): number {
   if (type === "correct") return 80;
   if (type === "add_constraint") return 60;
   if (type === "add_setting") return 50;
+  if (type === "regulate_roles") return 5;
   return 10; // ask
 }
 
@@ -452,9 +499,13 @@ async function directorStep(params: {
   // 2. 特殊指令：禁言/解除禁言 (静默处理)
   const first = room.interruptQueue[0];
   if (first?.type === "mute_roles" as any) {
-    room.interruptQueue.shift(); // 消费掉这个插话
-    // 注意：具体逻辑在 pickNextRole 之前已经由 socket 处理或在这里同步
-    // 我们返回一个空决策让循环继续
+    room.interruptQueue.shift();
+    return null as any;
+  }
+
+  // 2b. 特殊指令：情感调节 (静默处理)
+  if (first?.type === "regulate_roles" as any) {
+    room.interruptQueue.shift();
     return null as any;
   }
 
@@ -481,6 +532,7 @@ async function directorStep(params: {
 
 // 在模块级保持 rooms 引用
 const rooms = new Map<string, RoomRuntime>();
+let customRolesCache: RoleCard[] = [];
 
 async function runRoomLoop(roomId: string, io: IOServer, logger?: any) {
   const room = rooms.get(roomId);
@@ -689,6 +741,9 @@ async function main() {
       rooms.set(id, room);
     }
     console.log(`[Startup] Loaded ${loaded.size} rooms from disk`);
+
+    customRolesCache = await loadCustomRoles();
+    console.log(`[Startup] Loaded ${customRolesCache.length} custom roles`);
   } catch (err) {
     console.error("[Startup] Failed to load rooms:", err);
   }
@@ -741,15 +796,16 @@ async function main() {
     }
   }, async (req, reply) => {
     const { templateId } = req.query as { templateId?: RoomTemplateId };
-    
-    // 角色数据是静态的，设置 1 小时缓存
-    reply.header("Cache-Control", "public, max-age=3600");
+    reply.header("Cache-Control", "public, max-age=60");
 
     try {
-      let list = templateId ? getRolesByTemplate(templateId) : PRESET_ROLES;
-      if (list.length === 0) list = PRESET_ROLES;
+      const customRoles = await loadCustomRoles();
+      const allRoles = [...PRESET_ROLES, ...customRoles];
+      let list = templateId
+        ? allRoles.filter((r) => r.templateId === templateId)
+        : allRoles;
+      if (list.length === 0) list = allRoles;
 
-      // 仅返回列表渲染所需的精简字段
       return list.map(r => ({
         id: r.id,
         name: r.name,
@@ -764,10 +820,93 @@ async function main() {
     }
   });
 
+  // 角色分析：根据用户 prompt 智能推荐角色维度
+  fastify.post("/roles/analyze", async (req, reply) => {
+    const { prompt } = (req.body ?? {}) as { prompt?: string };
+    if (!prompt || prompt.trim().length === 0) {
+      return reply.status(400).send({ error: "prompt 不能为空" });
+    }
+    if (!openai) {
+      return reply.status(503).send({ error: "LLM 未配置，无法分析" });
+    }
+
+    try {
+      const analysis = await analyzePromptForRole(openai, env.OPENAI_MODEL, prompt.trim());
+      return { ok: true, analysis };
+    } catch (err: any) {
+      fastify.log.error(err, "API: Role analysis failed");
+      return reply.status(500).send({ error: err.message ?? "分析失败" });
+    }
+  });
+
+  // 创建自定义角色
+  fastify.post("/roles/create", async (req, reply) => {
+    const parsed = CreateCustomRoleInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+
+    try {
+      const roleCard = analysisToRoleCard(parsed.data.role);
+      // 检查是否重名
+      const existing = await loadCustomRoles();
+      if (existing.some((r) => r.name === roleCard.name)) {
+        roleCard.name = `${roleCard.name}_${Date.now().toString(36).slice(-4)}`;
+      }
+      await saveCustomRole(roleCard);
+      customRolesCache.push(roleCard);
+      return { ok: true, role: roleCard };
+    } catch (err: any) {
+      fastify.log.error(err, "API: Role creation failed");
+      return reply.status(500).send({ error: err.message ?? "创建失败" });
+    }
+  });
+
+  // 获取自定义角色列表
+  fastify.get("/roles/custom", async (_req, reply) => {
+    try {
+      const roles = await loadCustomRoles();
+      return roles;
+    } catch (err) {
+      fastify.log.error(err, "API: Failed to load custom roles");
+      return [];
+    }
+  });
+
+  // 删除历史房间
+  fastify.delete("/rooms/:roomId", async (req, reply) => {
+    const { roomId } = req.params as { roomId: string };
+    if (!roomId) return reply.status(400).send({ error: "roomId 不能为空" });
+    try {
+      rooms.delete(roomId);
+      await deleteRoomFile(roomId);
+      return { ok: true };
+    } catch (err: any) {
+      fastify.log.error(err, "API: Failed to delete room");
+      return reply.status(500).send({ error: err.message ?? "删除失败" });
+    }
+  });
+
+  // 删除自定义角色
+  fastify.delete("/roles/custom/:roleId", async (req, reply) => {
+    const { roleId } = req.params as { roleId: string };
+    if (!roleId) return reply.status(400).send({ error: "roleId 不能为空" });
+    try {
+      const deleted = await deleteCustomRole(roleId);
+      if (!deleted) return reply.status(404).send({ error: "角色不存在" });
+      customRolesCache = customRolesCache.filter((r) => r.id !== roleId);
+      return { ok: true };
+    } catch (err: any) {
+      fastify.log.error(err, "API: Failed to delete custom role");
+      return reply.status(500).send({ error: err.message ?? "删除失败" });
+    }
+  });
+
   // 2. 注册 CORS 插件
   await fastify.register(cors, {
-    origin: true, // 简化为 true 以解决所有跨域假死可能
+    origin: true,
     credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   });
 
   // 3. 启动服务器并挂载 Socket.io
@@ -823,6 +962,7 @@ async function main() {
           interruptQueue: [],
           running: false,
           mutedRoleIds: [],
+          regulateConfig: {},
           mentionRoleIds: [],
           turnIndex: 0,
         };
@@ -886,16 +1026,32 @@ async function main() {
       socket.on("room.mute", (data: { roomId: string; roleIds: string[]; muted: boolean }, ack?: (res: unknown) => void) => {
         const room = rooms.get(data.roomId);
         if (!room) return ack?.({ ok: false, error: "房间不存在" });
-        
+
         if (data.muted) {
-          // 禁言：加入列表
           room.mutedRoleIds = [...new Set([...room.mutedRoleIds, ...data.roleIds])];
         } else {
-          // 解除禁言：从列表移除
           room.mutedRoleIds = room.mutedRoleIds.filter(id => !data.roleIds.includes(id));
         }
 
         ack?.({ ok: true });
+        io.to(room.id).emit("room.state", {
+          roomId: room.id,
+          running: room.running,
+          mutedRoleIds: room.mutedRoleIds,
+          turnIndex: room.turnIndex,
+          name: room.config.name,
+          templateId: room.config.templateId,
+        });
+      });
+
+      socket.on("room.regulate", (data: { roomId: string; roleId: string; dimensions: RegulateDimensions }, ack?: (res: unknown) => void) => {
+        const room = rooms.get(data.roomId);
+        if (!room) return ack?.({ ok: false, error: "房间不存在" });
+        if (!room.config.activeRoleIds.includes(data.roleId)) return ack?.({ ok: false, error: "角色不属于当前房间" });
+
+        room.regulateConfig[data.roleId] = data.dimensions;
+        ack?.({ ok: true });
+
         io.to(room.id).emit("room.state", {
           roomId: room.id,
           running: room.running,

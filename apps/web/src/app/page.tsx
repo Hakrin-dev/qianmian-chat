@@ -3,8 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { RoleCard, RoomTemplateId } from "@qianmian/shared";
-import { fetchHistory, fetchRoles, type HistoryRoom } from "@/lib/api";
+import { deleteCustomRoleApi, deleteRoom, fetchCustomRoles, fetchHistory, fetchRoles, type HistoryRoom } from "@/lib/api";
 import { getSocket } from "@/lib/socket";
+import RoleCreator from "@/components/RoleCreator";
 
 const TEMPLATE_LABEL: Record<RoomTemplateId, string> = {
   emotional: "情感陪伴",
@@ -33,12 +34,14 @@ export default function HomePage() {
   const [templateId, setTemplateId] = useState<RoomTemplateId>("group");
   const [roomName, setRoomName] = useState("千面聊天室");
   const [roles, setRoles] = useState<RoleCard[]>([]);
+  const [customRoles, setCustomRoles] = useState<RoleCard[]>([]);
   const [history, setHistory] = useState<HistoryRoom[]>([]);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [rolesLoading, setRolesLoading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [showCreator, setShowCreator] = useState(false);
 
   const selectedRoleIds = useMemo(
     () => Object.entries(selected).filter(([, v]) => v).map(([k]) => k),
@@ -60,10 +63,14 @@ export default function HomePage() {
     fetchRoles(templateId)
       .then((list) => {
         if (cancelled) return;
-        setRoles(list);
+        // 预设角色
+        const preset = list.filter((r) => !r.id.startsWith("custom_"));
+        setRoles(preset);
+        // 自定义角色
+        const custom = list.filter((r) => r.id.startsWith("custom_"));
+        setCustomRoles(custom);
         const next: Record<string, boolean> = {};
-        // 自动选中前 3 个
-        for (const r of list.slice(0, 3)) next[r.id] = true;
+        for (const r of preset.slice(0, 3)) next[r.id] = true;
         setSelected(next);
       })
       .catch((e: unknown) => {
@@ -81,6 +88,7 @@ export default function HomePage() {
 
   useEffect(() => {
     loadHistory();
+    fetchCustomRoles().then(setCustomRoles).catch(() => {});
     return loadRoles();
   }, [templateId]);
 
@@ -91,6 +99,29 @@ export default function HomePage() {
       setSelected({});
     }
   }, [templateId]);
+
+  async function handleDeleteRoom(e: React.MouseEvent, roomId: string) {
+    e.stopPropagation();
+    if (!confirm("确定删除该历史对话吗？")) return;
+    try {
+      await deleteRoom(roomId);
+      setHistory((prev) => prev.filter((h) => h.id !== roomId));
+    } catch {
+      setError("删除失败");
+    }
+  }
+
+  async function handleDeleteCustomRole(e: React.MouseEvent, roleId: string) {
+    e.stopPropagation();
+    if (!confirm("确定删除该自定义角色吗？")) return;
+    try {
+      await deleteCustomRoleApi(roleId);
+      setCustomRoles((prev) => prev.filter((r) => r.id !== roleId));
+      setSelected((s) => { const n = { ...s }; delete n[roleId]; return n; });
+    } catch {
+      setError("删除角色失败");
+    }
+  }
 
   async function onCreateRoom() {
     setError(null);
@@ -151,22 +182,30 @@ export default function HomePage() {
                 <div className="py-10 text-center text-sm text-zinc-400 italic">暂无历史记录</div>
               ) : (
                 history.map((h) => (
-                  <button
-                    key={h.id}
-                    onClick={() => router.push(`/room/${encodeURIComponent(h.id)}`)}
-                    className="group w-full rounded-xl border border-zinc-100 p-3 text-left transition-all hover:border-zinc-300 hover:bg-zinc-50"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="text-xs">{TEMPLATE_ICON[h.templateId]}</span>
-                        <div className="truncate text-sm font-medium">{h.name}</div>
+                  <div key={h.id} className="group relative">
+                    <button
+                      onClick={() => router.push(`/room/${encodeURIComponent(h.id)}`)}
+                      className="w-full rounded-xl border border-zinc-100 p-3 text-left transition-all hover:border-zinc-300 hover:bg-zinc-50"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="text-xs">{TEMPLATE_ICON[h.templateId]}</span>
+                          <div className="truncate text-sm font-medium">{h.name}</div>
+                        </div>
+                        <span className="shrink-0 text-[10px] text-zinc-400 group-hover:text-zinc-600">
+                          {new Date(h.createdAt).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })}
+                        </span>
                       </div>
-                      <span className="shrink-0 text-[10px] text-zinc-400 group-hover:text-zinc-600">
-                        {new Date(h.createdAt).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })}
-                      </span>
-                    </div>
-                    <div className="mt-1 line-clamp-1 text-xs text-zinc-500">{h.lastMessage}</div>
-                  </button>
+                      <div className="mt-1 line-clamp-1 text-xs text-zinc-500">{h.lastMessage}</div>
+                    </button>
+                    <button
+                      onClick={(e) => handleDeleteRoom(e, h.id)}
+                      className="absolute right-1 top-1 hidden group-hover:flex h-5 w-5 items-center justify-center rounded-full bg-red-50 text-red-400 hover:bg-red-100 hover:text-red-600 text-xs"
+                      title="删除"
+                    >
+                      ×
+                    </button>
+                  </div>
                 ))
               )}
             </div>
@@ -269,8 +308,80 @@ export default function HomePage() {
                 ))
               )}
             </div>
+
+            {/* 自定义角色 */}
+            {customRoles.length > 0 && (
+              <>
+                <div className="mt-5 flex items-center gap-2">
+                  <div className="h-px flex-1 bg-purple-100" />
+                  <span className="text-xs font-semibold text-purple-600">✨ 自定义角色</span>
+                  <div className="h-px flex-1 bg-purple-100" />
+                </div>
+                <div className="mt-3 grid gap-2">
+                  {customRoles.map((r) => (
+                    <div key={r.id} className="group relative">
+                      <label
+                        className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-all ${
+                          selected[r.id]
+                            ? "border-purple-400 bg-purple-50 ring-1 ring-purple-400"
+                            : "border-purple-100 bg-white hover:border-purple-300"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!!selected[r.id]}
+                          onChange={(e) =>
+                            setSelected((s: Record<string, boolean>) => ({ ...s, [r.id]: e.target.checked }))
+                          }
+                          className="mt-1 h-4 w-4 rounded border-purple-300 text-purple-600 focus:ring-purple-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-lg">{r.avatar || "✨"}</span>
+                            <div className="truncate text-sm font-semibold">{r.name}</div>
+                            <span className="shrink-0 rounded-full bg-purple-100 px-1.5 py-0.5 text-[9px] text-purple-600">
+                              {TEMPLATE_LABEL[r.templateId]}
+                            </span>
+                          </div>
+                          <div className="mt-1 line-clamp-1 text-xs text-zinc-600">{r.identity}</div>
+                        </div>
+                      </label>
+                      <button
+                        onClick={(e) => handleDeleteCustomRole(e, r.id)}
+                        className="absolute right-1 top-1 hidden group-hover:flex h-5 w-5 items-center justify-center rounded-full bg-red-50 text-red-400 hover:bg-red-100 hover:text-red-600 text-xs"
+                        title="删除"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
           </section>
         </div>
+
+        {/* 角色创建 */}
+        <section className="mt-6 rounded-2xl bg-white p-5 shadow-sm ring-1 ring-zinc-200">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold">角色创建</h2>
+            <button
+              onClick={() => setShowCreator(!showCreator)}
+              className={`rounded-full px-4 py-1.5 text-xs font-semibold transition-all ${
+                showCreator
+                  ? "bg-purple-100 text-purple-700"
+                  : "bg-purple-600 text-white hover:bg-purple-700"
+              }`}
+            >
+              {showCreator ? "收起" : "✨ 创建新角色"}
+            </button>
+          </div>
+          {showCreator && (
+            <div className="mt-4">
+              <RoleCreator onCreated={() => { loadRoles(); fetchCustomRoles().then(setCustomRoles).catch(() => {}); setShowCreator(false); }} />
+            </div>
+          )}
+        </section>
 
         <footer className="mt-10 text-xs text-zinc-500">
           提示：默认先用“模拟流式”跑通体验；设置模型环境变量后会自动切换为真实大模型流式输出。

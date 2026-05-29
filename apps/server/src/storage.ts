@@ -69,8 +69,9 @@ function serializeRoom(room: RoomRuntime): SerializableRoom {
     relationships: room.relationships,
     crossMemory: room.crossMemory,
     interruptQueue: room.interruptQueue,
-    running: false, // 恢复后初始化为未运行
+    running: false,
     mutedRoleIds: room.mutedRoleIds,
+    regulateConfig: room.regulateConfig,
     mentionRoleIds: room.mentionRoleIds,
     turnIndex: room.turnIndex,
     lastSpeakerRoleId: room.lastSpeakerRoleId,
@@ -89,6 +90,7 @@ function deserializeRoom(data: any): RoomRuntime | null {
     interruptQueue: data.interruptQueue ?? [],
     running: false,
     mutedRoleIds: data.mutedRoleIds ?? [],
+    regulateConfig: data.regulateConfig ?? {},
     mentionRoleIds: data.mentionRoleIds ?? [],
     turnIndex: data.turnIndex ?? 0,
     lastSpeakerRoleId: data.lastSpeakerRoleId,

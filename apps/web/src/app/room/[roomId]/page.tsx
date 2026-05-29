@@ -2,9 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import type { InterruptType, RoleCard, RoomTemplateId } from "@qianmian/shared";
+import type { CustomDimensionMeta, InterruptType, RegulateDimensions, RoleCard, RoomTemplateId } from "@qianmian/shared";
 import { getSocket } from "@/lib/socket";
 import { useRoomStore, type ChatMessage } from "@/lib/store";
+import RadarChart from "@/components/RadarChart";
 
 const INTERRUPT_LABEL: Record<InterruptType, string> = {
   ask: "普通插话",
@@ -13,15 +14,17 @@ const INTERRUPT_LABEL: Record<InterruptType, string> = {
   add_setting: "新增设定",
   change_goal: "改目标",
   mute_roles: "禁言/解除",
+  regulate_roles: "情感调节",
   stop: "停止",
 };
 
-type InteractionCategory = "chat" | "modify" | "mute" | "stop";
+type InteractionCategory = "chat" | "modify" | "mute" | "regulate" | "stop";
 
 const CATEGORY_LABELS: Record<InteractionCategory, { label: string; icon: string }> = {
   chat: { label: "插话", icon: "💬" },
   modify: { label: "对话修改", icon: "🛠️" },
   mute: { label: "禁言", icon: "🙊" },
+  regulate: { label: "调节", icon: "🎚️" },
   stop: { label: "停止", icon: "🛑" },
 };
 
@@ -31,6 +34,25 @@ const MODIFY_SUB_TYPES: Array<{ label: string; type: InterruptType; icon: string
   { label: "改目标", type: "change_goal", icon: "🎯" },
   { label: "加设定", type: "add_setting", icon: "🎭" },
 ];
+
+type FixedDimKey = "creativity" | "talkativeness" | "emotional" | "cooperativeness" | "seriousness";
+
+const REGULATE_DIMENSIONS: Array<{ key: FixedDimKey; label: string; low: string; high: string }> = [
+  { key: "creativity", label: "创意/脑洞度", low: "保守", high: "天马行空" },
+  { key: "talkativeness", label: "话痨/活跃度", low: "沉默", high: "话痨" },
+  { key: "emotional", label: "情感丰富度", low: "冷静", high: "热情" },
+  { key: "cooperativeness", label: "配合/亲和度", low: "高冷", high: "亲和" },
+  { key: "seriousness", label: "犀利/批判度", low: "温和", high: "犀利" },
+];
+
+const DEFAULT_REGULATE: RegulateDimensions = {
+  creativity: 50,
+  talkativeness: 50,
+  emotional: 50,
+  cooperativeness: 50,
+  seriousness: 50,
+  custom: {},
+};
 
 type RoomStateEvent = {
   roomId: string;
@@ -79,6 +101,12 @@ export default function RoomPage() {
   const [selectedRoleIdsForAction, setSelectedRoleIdsForAction] = useState<string[]>([]);
   const [showMentionPanel, setShowMentionPanel] = useState(false);
   const [templateId, setTemplateId] = useState<RoomTemplateId>("group");
+  const [regulateRoleId, setRegulateRoleId] = useState<string | null>(null);
+  const [regulateValues, setRegulateValues] = useState<RegulateDimensions>({ ...DEFAULT_REGULATE });
+  const [savedRegulations, setSavedRegulations] = useState<Record<string, RegulateDimensions>>({});
+  const [customDimsMeta, setCustomDimsMeta] = useState<CustomDimensionMeta[]>([]);
+  const [showAddDim, setShowAddDim] = useState(false);
+  const [newDim, setNewDim] = useState<CustomDimensionMeta>({ key: "", label: "", low: "低", high: "高" });
   const listRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -88,6 +116,7 @@ export default function RoomPage() {
     // 监听分类变化，自动设置默认子类型
     if (activeCategory === "chat") setInterruptType("ask");
     else if (activeCategory === "mute") setInterruptType("mute_roles");
+    else if (activeCategory === "regulate") setInterruptType("regulate_roles");
     else if (activeCategory === "stop") setInterruptType("stop");
     else if (activeCategory === "modify") {
       // 保持之前的子类型，或者默认设为 ask (提问)
@@ -188,17 +217,32 @@ export default function RoomPage() {
   async function sendUserMessage() {
     setError(null);
     const text = content.trim();
-    if (!text) return;
 
     if (interruptType === "mute_roles") {
       if (selectedRoleIdsForAction.length === 0) return setError("请先选择要禁言/解除的角色");
-      // 逻辑：如果选中的人都在禁言列表里，则解除；否则全部禁言
       const allMuted = selectedRoleIdsForAction.every(id => mutedRoleIds.includes(id));
       socket.emit("room.mute", { roomId, roleIds: selectedRoleIdsForAction, muted: !allMuted });
       setSelectedRoleIdsForAction([]);
       setContent("");
       return;
     }
+
+    if (interruptType === "regulate_roles") {
+      if (!regulateRoleId) return setError("请先选择要调节的角色");
+      const newSaved = { ...savedRegulations, [regulateRoleId]: { ...regulateValues } };
+      setSavedRegulations(newSaved);
+      socket.emit("room.regulate", { roomId, roleId: regulateRoleId, dimensions: regulateValues });
+      if (text) {
+        socket.emit("user.message", { roomId, content: text, interruptType, mentionRoleIds: [regulateRoleId] }, (ack: unknown) => {
+          const res = (ack ?? { ok: false }) as GenericAck;
+          if (!res?.ok) setError(typeof res.error === "string" ? res.error : "发送失败");
+        });
+      }
+      setContent("");
+      return;
+    }
+
+    if (!text) return;
 
     setContent("");
     const mentionRoleIds = selectedRoleIdsForAction;
@@ -217,7 +261,7 @@ export default function RoomPage() {
 
   async function sendAndStart() {
     await sendUserMessage();
-    if (interruptType !== "stop" && interruptType !== "mute_roles" && !running) startAuto();
+    if (interruptType !== "stop" && interruptType !== "mute_roles" && interruptType !== "regulate_roles" && !running) startAuto();
   }
 
   function startAuto() {
@@ -410,13 +454,236 @@ export default function RoomPage() {
                 })}
               </div>
             )}
+
+            {/* 情感调节面板 */}
+            {activeCategory === "regulate" && roles.length > 0 && (
+              <div className="space-y-3 animate-in fade-in slide-in-from-top-1 duration-200">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 mr-1">
+                    选择角色:
+                  </span>
+                  {roles.map((r) => {
+                    const isSelected = regulateRoleId === r.id;
+                    const hasSaved = savedRegulations[r.id] !== undefined;
+                    return (
+                      <button
+                        key={r.id}
+                        onClick={() => {
+                          setRegulateRoleId(r.id);
+                          setRegulateValues(savedRegulations[r.id] ?? { ...DEFAULT_REGULATE });
+                        }}
+                        className={`rounded-full px-2 py-1 text-[11px] font-medium transition-all ${
+                          isSelected
+                            ? "bg-purple-100 text-purple-700 ring-1 ring-purple-300"
+                            : "bg-zinc-50 text-zinc-500 hover:bg-zinc-100"
+                        }`}
+                      >
+                        {r.avatar} {r.name} {hasSaved && "✓"}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {regulateRoleId && (() => {
+                  const allAxes = [
+                    ...REGULATE_DIMENSIONS.map((d) => ({ key: d.key, label: d.label, low: d.low, high: d.high })),
+                    ...customDimsMeta.map((d) => ({ key: d.key, label: d.label, low: d.low, high: d.high })),
+                  ];
+                  const { custom: _custom, ...fixedVals } = regulateValues;
+                  const allValues: Record<string, number> = { ...fixedVals, ...(regulateValues.custom ?? {}) };
+
+                  return (
+                  <div className="rounded-xl border border-purple-100 bg-purple-50/30 p-4 space-y-4">
+                    <div className="text-xs font-semibold text-purple-800">
+                      调节「{roles.find((r) => r.id === regulateRoleId)?.name ?? ""}」的个性维度
+                    </div>
+
+                    {/* 雷达图 */}
+                    <div className="flex justify-center">
+                      <RadarChart
+                        axes={allAxes}
+                        values={allValues}
+                        onChange={(key, val) => {
+                          const isFixed = REGULATE_DIMENSIONS.some((d) => d.key === key);
+                          if (isFixed) {
+                            setRegulateValues((prev) => ({ ...prev, [key]: val }));
+                          } else {
+                            setRegulateValues((prev) => ({
+                              ...prev,
+                              custom: { ...(prev.custom ?? {}), [key]: val },
+                            }));
+                          }
+                        }}
+                      />
+                    </div>
+
+                    {/* 分隔线 */}
+                    <div className="flex items-center gap-2">
+                      <div className="h-px flex-1 bg-purple-100" />
+                      <span className="text-[10px] text-zinc-400">精确调节</span>
+                      <div className="h-px flex-1 bg-purple-100" />
+                    </div>
+
+                    {/* 固定维度滑块 */}
+                    {REGULATE_DIMENSIONS.map((dim) => (
+                      <div key={dim.key} className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-medium text-zinc-600">{dim.label}</span>
+                          <span className="text-xs font-bold text-purple-700 tabular-nums">
+                            {regulateValues[dim.key]}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] text-zinc-400 w-10 text-right shrink-0">{dim.low}</span>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            value={regulateValues[dim.key]}
+                            onChange={(e) =>
+                              setRegulateValues((prev) => ({ ...prev, [dim.key]: Number(e.target.value) }))
+                            }
+                            className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-purple-200 accent-purple-600 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-purple-600 [&::-webkit-slider-thumb]:shadow-sm"
+                          />
+                          <span className="text-[10px] text-zinc-400 w-10 shrink-0">{dim.high}</span>
+                        </div>
+                      </div>
+                    ))}
+
+                    {/* 自定义维度滑块 */}
+                    {customDimsMeta.length > 0 && (
+                      <div className="border-t border-purple-100 pt-3">
+                        <div className="text-[10px] font-semibold text-purple-600 mb-2">自定义维度</div>
+                        {customDimsMeta.map((dim) => (
+                          <div key={dim.key} className="space-y-1 mb-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-medium text-purple-600">{dim.label}</span>
+                              <div className="flex items-center gap-1">
+                                <span className="text-xs font-bold text-purple-700 tabular-nums">
+                                  {regulateValues.custom?.[dim.key] ?? 50}
+                                </span>
+                                <button
+                                  onClick={() => {
+                                    setCustomDimsMeta((prev) => prev.filter((d) => d.key !== dim.key));
+                                    setRegulateValues((prev) => {
+                                      const c = { ...(prev.custom ?? {}) };
+                                      delete c[dim.key];
+                                      return { ...prev, custom: c };
+                                    });
+                                  }}
+                                  className="text-[10px] text-red-400 hover:text-red-600 ml-1"
+                                >
+                                  删除
+                                </button>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] text-zinc-400 w-10 text-right shrink-0">{dim.low}</span>
+                              <input
+                                type="range"
+                                min={0}
+                                max={100}
+                                value={regulateValues.custom?.[dim.key] ?? 50}
+                                onChange={(e) =>
+                                  setRegulateValues((prev) => ({
+                                    ...prev,
+                                    custom: { ...(prev.custom ?? {}), [dim.key]: Number(e.target.value) },
+                                  }))
+                                }
+                                className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-purple-200 accent-purple-600 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-purple-600 [&::-webkit-slider-thumb]:shadow-sm"
+                              />
+                              <span className="text-[10px] text-zinc-400 w-10 shrink-0">{dim.high}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* 新增自定义维度 */}
+                    {!showAddDim ? (
+                      <button
+                        onClick={() => setShowAddDim(true)}
+                        className="w-full rounded-lg border border-dashed border-purple-300 py-1.5 text-[11px] text-purple-500 hover:bg-purple-50 transition-colors"
+                      >
+                        + 新增维度
+                      </button>
+                    ) : (
+                      <div className="rounded-lg border border-purple-200 bg-white p-3 space-y-2">
+                        <div className="text-[10px] font-semibold text-purple-600">新增自定义维度</div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <input
+                            value={newDim.label}
+                            onChange={(e) => {
+                              const label = e.target.value;
+                              const key = label.replace(/[^a-zA-Z0-9一-鿿]/g, "_").toLowerCase() || "custom";
+                              setNewDim({ ...newDim, label, key });
+                            }}
+                            placeholder="维度名称（如：耐心度）"
+                            className="col-span-2 rounded-md border border-zinc-200 px-2 py-1 text-[11px] outline-none focus:border-purple-400"
+                          />
+                          <input
+                            value={newDim.low}
+                            onChange={(e) => setNewDim({ ...newDim, low: e.target.value })}
+                            placeholder="低端标签"
+                            className="rounded-md border border-zinc-200 px-2 py-1 text-[11px] outline-none focus:border-purple-400"
+                          />
+                          <input
+                            value={newDim.high}
+                            onChange={(e) => setNewDim({ ...newDim, high: e.target.value })}
+                            placeholder="高端标签"
+                            className="rounded-md border border-zinc-200 px-2 py-1 text-[11px] outline-none focus:border-purple-400"
+                          />
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => {
+                              if (!newDim.label.trim()) return;
+                              setCustomDimsMeta((prev) => [...prev, { ...newDim, key: newDim.key || `dim_${Date.now().toString(36)}` }]);
+                              setRegulateValues((prev) => ({
+                                ...prev,
+                                custom: { ...(prev.custom ?? {}), [newDim.key || `dim_${Date.now().toString(36)}`]: 50 },
+                              }));
+                              setNewDim({ key: "", label: "", low: "低", high: "高" });
+                              setShowAddDim(false);
+                            }}
+                            className="flex-1 rounded-md bg-purple-600 py-1 text-[11px] font-medium text-white hover:bg-purple-700"
+                          >
+                            添加
+                          </button>
+                          <button
+                            onClick={() => { setShowAddDim(false); setNewDim({ key: "", label: "", low: "低", high: "高" }); }}
+                            className="rounded-md border border-zinc-200 px-3 py-1 text-[11px] text-zinc-500 hover:bg-zinc-50"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <button
+                      onClick={() => {
+                        const newSaved = { ...savedRegulations, [regulateRoleId]: { ...regulateValues } };
+                        setSavedRegulations(newSaved);
+                        socket.emit("room.regulate", { roomId, roleId: regulateRoleId, dimensions: regulateValues });
+                      }}
+                      className="w-full rounded-xl bg-purple-600 py-2 text-xs font-semibold text-white hover:bg-purple-700 transition-colors"
+                    >
+                      应用调节
+                    </button>
+                  </div>
+                  );
+                })()}
+              </div>
+            )}
+
           </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <label className="block flex-1">
               <div className="text-sm font-medium text-zinc-700">
-                {activeCategory === "chat" ? "你的话 (插话)" : 
+                {activeCategory === "chat" ? "你的话 (插话)" :
                  activeCategory === "modify" ? `修改建议 (${INTERRUPT_LABEL[interruptType]})` :
-                 activeCategory === "mute" ? "禁言备注 (可选)" : "停止理由 (可选)"}
+                 activeCategory === "mute" ? "禁言备注 (可选)" :
+                 activeCategory === "regulate" ? "调节备注 (可选)" : "停止理由 (可选)"}
               </div>
               <textarea
                 ref={textareaRef}
@@ -436,6 +703,8 @@ export default function RoomPage() {
                 placeholder={
                   activeCategory === "mute"
                     ? "选中角色后，点击发送执行禁言/解除"
+                    : activeCategory === "regulate"
+                    ? "调节角色个性后点击「应用调节」，或输入备注后发送"
                     : activeCategory === "stop"
                     ? "输入停止理由，点击发送终止对话"
                     : "Enter 发送；Ctrl/⌘ + Enter 换行；输入 @ 选择角色"

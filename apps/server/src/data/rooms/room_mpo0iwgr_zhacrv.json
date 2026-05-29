@@ -1,0 +1,33 @@
+{
+  "id": "room_mpo0iwgr_zhacrv",
+  "config": {
+    "name": "千面聊天室",
+    "templateId": "group",
+    "selectedRoleIds": [
+      "custom_晴姐姐_mpo0i8vf",
+      "g_lazy_buddy",
+      "g_haibara",
+      "g_hu_tao",
+      "g_chaotic_madman"
+    ],
+    "activeRoleIds": [
+      "custom_晴姐姐_mpo0i8vf",
+      "g_lazy_buddy",
+      "g_haibara",
+      "g_hu_tao",
+      "g_chaotic_madman"
+    ],
+    "maxTurns": 24,
+    "windowSize": 20
+  },
+  "messages": [],
+  "summary": "",
+  "relationships": {},
+  "crossMemory": {},
+  "interruptQueue": [],
+  "running": false,
+  "mutedRoleIds": [],
+  "regulateConfig": {},
+  "mentionRoleIds": [],
+  "turnIndex": 0
+}
